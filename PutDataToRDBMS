@@ -1,0 +1,144 @@
+package com.bac.rctt.apps.flowbot.processors
+
+import java.util.Properties
+
+import com.bac.rctt.apps.flowbot.envelope.{ DataFrameEnvelope, FlowEnvelope }
+import com.bac.rctt.apps.flowbot.util.EncryptionUtil
+import org.apache.spark.SparkContext
+import akka.actor.{ ActorSystem, Props }
+import com.bac.rctt.apps.flowbot.util.{ ActorMessage, ScheduleActorForTables, ActorMessageForWrite }
+
+/**
+ * Date      		Developer                  	Change
+ * ========= 		========================== 	===============================================================
+ * 21-Aug-17    	Jain Ankita                 Commented check quality (remove policy change)
+ * 12-Sep-17			Vemuri,PhaniKumar           Implemented parallelism for exports to Database
+ * 28-Sep-17			Ramamurthy Pavan. N					Added the validation related to maxConnections and maxConnectionsPerTable parameters.
+ *
+ *
+ */
+
+class PutDataToRDBMS() extends BaseProcessor {
+
+  def run(sc: SparkContext, hiveContext: org.apache.spark.sql.hive.HiveContext, flowEnvelope: FlowEnvelope, step: String): FlowEnvelope = {
+    implicit var writeCounter = sc.accumulator(0)
+    var numTables: Int = 0
+    var saveList: String = {
+      if (flowEnvelope.hasAttribute(step + ".saveListLiteral")) {
+        flowEnvelope.getAttribute(step + ".saveListLiteral")
+      } else {
+        hdfsFileAsString(flowEnvelope.getAttribute(step + ".saveListFile"), flowEnvelope)
+      }
+    }
+
+    val system = ActorSystem("Main")
+    logger.info("Creating Actors for saving dataframe to DBMS")
+    val actor = system.actorOf(Props(ScheduleActorForTables(flowEnvelope.getOrDefault(step + ".maxConnections", 1).toInt, flowEnvelope.getOrDefault(step + ".maxConnectionsPerTable", 1).toInt)))
+
+    var subStepNumber = 1
+
+    saveList.trim().split(";").foreach(saveItem => {
+      logger.info("Query to execute:" + saveList)
+      var newstep = step + "-" + subStepNumber
+      logger.info("New Step Name:" + newstep)
+
+      var sqlSourceDS = saveItem.substring(0, saveItem.lastIndexOf(" "))
+      var sqlTargetDS = saveItem.substring(saveItem.lastIndexOf(" ") + 1, saveItem.length())
+
+      flowEnvelope.cloneAttributes(step, newstep)
+
+      flowEnvelope.setAttribute(newstep + ".name", sqlSourceDS)
+      flowEnvelope.setAttribute(newstep + ".table", sqlTargetDS)
+
+      logger.info("found putDataToRDBMS step! Going to pass '" + newstep + "' to sp.putDataToRDBMS")
+
+      actor ! ActorMessageForWrite(hiveContext, flowEnvelope, newstep, writeCounter)
+      numTables += 1
+      subStepNumber += 1
+      Thread.sleep(3000)
+    })
+
+    while (writeCounter.value < numTables) {
+      Thread.sleep(1000);
+      logger.debug("waiting on tables to complete.")
+      logger.debug("counter.value=" + writeCounter.value + " table count=" + numTables)
+    }
+    system.shutdown()
+
+    flowEnvelope
+  }
+
+  // moved the below method to Worker.scala
+
+  /*def putTempTableToRDBMS(hiveContext: org.apache.spark.sql.hive.HiveContext, flowEnvelope: FlowEnvelope, step: String): DataFrameEnvelope = {
+    logger.info("Running putTempTabletoRdbms")
+    if (!flowEnvelope.hasAttribute(step + ".saveMode") || !flowEnvelope.hasAttribute(step + ".dbtype") || !flowEnvelope.hasAttribute(step + ".hostname") || !flowEnvelope.hasAttribute(step + ".database") || !flowEnvelope.hasAttribute(step + ".table")) {
+      throw new Exception("putTempTableToRDBMS is missing attributes.  Expecting saveMode,dbtype,hostname,database,table!")
+    } else {
+      logger.info("saveMode: " + flowEnvelope.getAttribute(step + ".saveMode"))
+      logger.info("dbtype: " + flowEnvelope.getAttribute(step + ".dbtype"))
+      logger.info("hostname: " + flowEnvelope.getAttribute(step + ".hostname"))
+      logger.info("database: " + flowEnvelope.getAttribute(step + ".database"))
+      logger.info("table: " + flowEnvelope.getAttribute(step + ".table"))
+    }
+
+    val envelope: DataFrameEnvelope = new DataFrameEnvelope(step)
+    envelope.setAttribute(step + ".function-uuid", "f1720382-317a-4e4d-b0c3-be878b462786")
+    //envelope.mergeAttributesWithFilter(flowEnvelope.getAttributes(), step)
+    envelope.mergeAttributes(flowEnvelope.getAttributes())
+    logger.info("Sql Query to Execute:" + "select * from " + envelope.getAttribute(step + ".name"))
+    envelope.setDataFrame(hiveContext.sql("select * from " + envelope.getAttribute(step + ".name")))
+
+    val decryptedPassword = new EncryptionUtil().decryptPassword(envelope, step)
+
+    val properties = new Properties()
+    properties.put("user", envelope.getAttribute(step + ".username"))
+    properties.put("password", decryptedPassword)
+    properties.put("database", envelope.getAttribute(step + ".database"))
+    properties.put("driver", envelope.getAttribute(step + ".driver"))
+    logger.info("putTempTableToRDBMS command:" + "envelope.getDataFrame().write.mode(" + envelope.getAttribute(step + ".saveMode") + ").jdbc(jdbc:" + envelope.getAttribute(step + ".dbtype") + "://" + envelope.getAttribute(step + ".hostname") + ", " + envelope.getAttribute(step + ".database") + "." + envelope.getAttribute(step + ".table") + ", properties)")
+    envelope.getDataFrame().write.mode(envelope.getAttribute(step + ".saveMode")).jdbc("jdbc:" + envelope.getAttribute(step + ".dbtype") + "://" + envelope.getAttribute(step + ".hostname"), envelope.getAttribute(step + ".database") + "." + envelope.getAttribute(step + ".table"), properties)
+
+    envelope
+  }*/
+
+  override def validate(flowEnvelope: FlowEnvelope, step: String): Boolean = {
+    logger.info("Verifying " + step)
+    var confGood = super.validate(flowEnvelope: FlowEnvelope, step: String)
+
+    if (!flowEnvelope.hasAttribute(step + ".saveListLiteral") && !flowEnvelope.hasAttribute(step + ".saveListFile")) {
+      logger.error(step + " is missing both saveListLiteral and saveListFile. One of the two must be defined for action putDataToRDBMS.")
+      confGood = false
+    }
+    if (flowEnvelope.hasAttribute(step + ".saveListLiteral") && flowEnvelope.hasAttribute(step + ".saveListFile")) {
+      logger.error(step + " has attribute saveListLiteral and saveListFile. Only one can be defined for action putDataToRDBMS.")
+      confGood = false
+    }
+    for (attribute <- Set("username", "password", "driver", "saveMode", "jdbcUrl")) {
+      if (!flowEnvelope.hasAttribute(step + "." + attribute)) {
+        logger.error(step + " is missing attribute " + attribute + ", which is required for action putDataToRDBMS")
+        confGood = false
+      }
+    }
+    
+    if (flowEnvelope.hasAttribute(step + ".maxConnections") && !flowEnvelope.hasAttribute(step + ".maxConnectionsPerTable")) {
+      logger.error(step + " has attribute maxConnections but is missing maxConnectionsPerTable.")
+      confGood = false
+    }
+    
+    if (flowEnvelope.hasAttribute(step + ".maxConnectionsPerTable") && !flowEnvelope.hasAttribute(step + ".maxConnections")) {
+      logger.error(step + " has attribute maxConnectionsPerTable but is missing maxConnections.")
+      confGood = false
+    }
+    
+    if (flowEnvelope.hasAttribute(step + ".maxConnectionsPerTable") && flowEnvelope.hasAttribute(step + ".maxConnections")) {
+      if (flowEnvelope.getAttribute(step + ".maxConnectionsPerTable").toInt > flowEnvelope.getAttribute(step + ".maxConnections").toInt) {
+        logger.error(step + ": maxConnectionsPerTable cannot exceed maxConnections.")
+        confGood = false
+      }
+    }    
+    
+    confGood
+  }
+
+}
