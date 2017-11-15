@@ -1,0 +1,21 @@
+package flowbot.flows
+
+import org.apache.spark.SparkContext
+import org.apache.spark.SparkContext._
+import com.typesafe.config._
+import com.bac.rctt.apps.flowbot.processors._
+import com.bac.rctt.apps.flowbot.flows
+import com.bac.rctt.apps.flowbot.envelope._
+
+
+class FlowStub() extends Flow {
+
+  private val uuid: String = "REPLACE WITH NEW UUID. Can be generated using: java.util.UUID.randomUUID()"
+
+    
+def run(sc: SparkContext, conf: Config) {
+      
+   //code goes here.  copy and paste from spark-shell
+  
+  }
+}
