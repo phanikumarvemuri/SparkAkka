@@ -1,0 +1,202 @@
+package flowbot.envelope
+
+import com.bac.rctt.apps.flowbot.dataquality.FirstPassStats
+import com.bac.rctt.apps.flowbot.util.Functions
+import org.apache.spark.sql.DataFrame
+import org.apache.spark.sql.types.{DataType, DataTypes, StringType, StructField}
+import org.apache.spark.sql.Column
+import org.apache.spark.sql.functions._
+import scala.collection.mutable.MutableList
+
+class DataFrameEnvelope(tag: String) extends Envelope() {
+
+  private var _df: DataFrame = null;
+
+  logger.info("New Instance of DataFrameEnvelope")
+  this.setAttribute(tag + "-dataFrameEnvelope-uuid", Functions.getUUID())
+  this.setAttribute(tag + "-created", Functions.getCurrentMillis())
+
+  def setDataFrame(df: DataFrame) = {
+    logger.info("setDataFrame")
+
+    val dataSetName = this.getAttribute(tag + ".name")
+
+    //fix column case issue
+    var _tmpDf = df.select("*")    // THIS IS A WORKAROUND FOR BUG SEI-1632 where a dataframe with column result will return an analysis error 
+    logger.info("Fixing column name cases")
+    for(col <- df.columns){
+      _tmpDf = _tmpDf.withColumnRenamed(col,col.toLowerCase())
+    }
+
+    //fix parquet/hive serde compatibilty issue
+    logger.info("Inspecting shema for hive/parquet incompatibility issues")
+    for(col <- _tmpDf.schema){
+      if(col.dataType.toString().equals("DateType")){
+         _tmpDf = castColumnTo(_tmpDf, col.name, StringType)
+      }
+    }
+
+    //drop columns
+    if(this.hasAttribute(tag + ".dropColumns")){
+      logger.info("Dropping columns dropColumns=" + this.getAttribute(tag + ".dropColumns") )
+      _tmpDf = this.dropColumn(_tmpDf, this.getAttribute(tag + ".dropColumns"))
+    }
+
+
+    if(this.hasAttribute(tag + ".addColumns")) {
+      val columnsToAdd = this.getAttribute(tag + ".addColumns").split(",").toSeq
+      logger.info("Adding Columns")
+
+      if (columnsToAdd.contains("uuid")) {
+        logger.info("Adding uuid to:" + dataSetName)
+        _tmpDf = _tmpDf.withColumn("uuid", lit(Functions.getUUID()))
+      }
+
+      if (columnsToAdd.contains("timestamp")) {
+        logger.info("Adding timestamp to:" + dataSetName)
+        _tmpDf = _tmpDf.withColumn("timestamp", current_timestamp())
+      }
+
+      if (columnsToAdd.contains("date")) {
+        logger.info("Adding date to:" + dataSetName)
+        _tmpDf = _tmpDf.withColumn("date", current_date())
+      }
+    }
+
+    this._df =  _tmpDf
+    
+    logger.info("Collects stats attribute has value " + this.getAttribute(tag + ".collectStats"))
+    if(this.hasAttribute(tag + ".collectStats") && this.getAttribute(tag + ".collectStats").contains(dataSetName)) {      
+      this.collectStats(dataSetName.toLowerCase(), this.getAttribute(tag + ".collectStats"))
+    }
+
+
+
+    logger.info("Registering new temp table: " + dataSetName)
+    this._df.registerTempTable(dataSetName)
+  }
+
+   def setSchemaDataFrame(df: DataFrame) = {  
+    logger.info("setSchemaDataFrame")
+    this._df = df
+  }
+
+  def castColumnTo( df: DataFrame, cn: String, tpe: DataType ) : DataFrame = {
+    df.withColumn( cn, df(cn).cast(tpe) )
+  }
+
+  def dropColumn( df: DataFrame, colNameList: String ) : DataFrame = {
+    val colsToRemove = colNameList.split(",").toSeq
+    df.select(df.columns.filter(colName => !colsToRemove.contains(colName)).map(colName => new Column(colName)): _*)
+  }
+
+ def getDataFrame(): DataFrame = {
+    logger.info("getDataFrame")
+    this._df
+  }
+
+
+  private def collectStats(dataSetName: String, items: String) = {
+    logger.info("collectStats")
+    logger.info("collecting stats on " + dataSetName)
+
+    var tempDataFrame: DataFrame = _df
+    var columnList = MutableList[String]()
+    
+    items.trim().split(",").foreach(item => {
+      
+      if (items == dataSetName){
+        logger.info("Collect stats on complete Dataset for " + dataSetName) // No need to process the other columns of this dataset.
+      }else if (item.startsWith(dataSetName + ".")){ //This means user want to collect stats only for specific columns    
+        logger.info("Adding column : " + item + " to the list")
+        columnList += item.replaceAll(dataSetName +  ".", "")
+      }
+    })
+    
+    if (columnList.length > 0){
+      tempDataFrame = _df.select(columnList(0), columnList.tail:_*)
+    }
+
+    //get list of columns for this dataframe that are in the list
+     val schema = tempDataFrame.schema
+
+    //we are about to iterate over the dataframe, we should cache it first.
+    tempDataFrame.cache()
+
+    val columnValueCounts = tempDataFrame.flatMap(row =>
+      (0 until schema.length).map { index =>
+          ((index, row.get(index)),  1l)
+      }
+    ).reduceByKey(_ + _)
+
+    val firstPassStats = columnValueCounts.mapPartitions[FirstPassStats]{it =>
+      val firstPassStatsModel = new FirstPassStats()
+      it.foreach{ case ((columnIndex, columnValue), count) =>
+        firstPassStatsModel += (columnIndex, columnValue, count)
+      }
+      Iterator(firstPassStatsModel)
+    }.reduce { (a, b) =>
+      a += (b)
+      a
+    }
+
+    firstPassStats.columnStatsMap.foreach({
+      case (k, v) =>
+        val sf: StructField = schema.fields(k)        
+        val sfName = sf.name
+        val count = v.totalCount
+        val nullCount = v.nulls
+        
+        this.setAttribute(tag + "." + dataSetName + "-" + sfName + "-empties", v.empties.toString())
+        this.setAttribute("flow.stats." + dataSetName + "." + sfName + ".empties", v.empties.toString())
+        
+        this.setAttribute(tag + "." + dataSetName + "-" + sfName + "-nulls", v.nulls.toString())
+        this.setAttribute("flow.stats." + dataSetName + "." + sfName + ".nulls", v.nulls.toString())
+        
+        this.setAttribute(tag + "." + dataSetName + "-" + sfName + "-uniqueValues", v.uniqueValues.toString())
+        this.setAttribute("flow.stats." + dataSetName + "." + sfName + ".uniqueValues", v.uniqueValues.toString())
+        
+        this.setAttribute(tag + "." + dataSetName + "-" + sfName + "-totalCount", v.totalCount.toString())
+        this.setAttribute("flow.stats." + dataSetName + "." + sfName + ".totalCount", v.totalCount.toString())
+        
+        if(sf.dataType == DataTypes.LongType || sf.dataType == DataTypes.DoubleType || sf.dataType == DataTypes.FloatType || sf.dataType == DataTypes.IntegerType || sf.dataType.simpleString.contains("decimal")) {
+          this.setAttribute(tag + "." + dataSetName + "-" + sfName + "-max", if (count == nullCount)  "null" else toStringWithNullHandled(v.max))
+          this.setAttribute("flow.stats." + dataSetName + "." + sfName + ".max", if (count == nullCount)  "null" else toStringWithNullHandled(v.max))
+          
+          this.setAttribute(tag + "." + dataSetName + "-" + sfName + "-min", if (count == nullCount)  "null" else toStringWithNullHandled(v.min))
+          this.setAttribute("flow.stats." + dataSetName + "." + sfName + ".min", if (count == nullCount)  "null" else toStringWithNullHandled(v.min))
+          
+          this.setAttribute(tag + "." + dataSetName + "-" + sfName + "-sum", if (count == nullCount)  "null" else toStringWithNullHandled(v.sum))
+          this.setAttribute("flow.stats." + dataSetName + "." + sfName + ".sum", if (count == nullCount)  "null" else toStringWithNullHandled(v.sum))
+          
+          this.setAttribute(tag + "." + dataSetName + "-" + sfName + "-avg", if (count == nullCount)  "null" else toStringWithNullHandled(v.avg))
+          this.setAttribute("flow.stats." + dataSetName + "." + sfName + ".avg", if (count == nullCount)  "null" else toStringWithNullHandled(v.avg))
+        }
+        this.setAttribute(tag + "." + dataSetName + "-" + sfName + "-dataType", sf.dataType.typeName)
+        this.setAttribute("flow.stats." + dataSetName + "." + sfName + ".dataType", sf.dataType.typeName)
+
+        this.setAttribute(tag + "." + dataSetName + "-count", v.totalCount.toString())
+        this.setAttribute("flow.stats." + dataSetName + ".count", v.totalCount.toString())
+
+        logger.debug("loading attribute key=" + sfName+ " value=" + v.toString())
+//        var i: Int = 0
+//             
+//        v.topNValues.topNCountsForColumnArray.foreach({
+//          case (k1,v1) => this.addAttribute(sf.name + "-topN-" + (i += 1).toString() , v1.toString() + "-" + k1.toString())
+//          logger.debug("loading attribute key=" + sf.name + " value=" + v1.toString() + "-" + k1.toString())
+//          })
+
+    })
+
+     logger.info("count of " + dataSetName + " is " + this.getAttribute(tag + "." + dataSetName + "-count"))
+  }
+  
+  def toStringWithNullHandled(obj: Any) : String = {
+    if (obj == null)
+      "null"
+    else
+      obj.toString()
+  }
+
+
+}
