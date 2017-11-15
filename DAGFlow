@@ -1,0 +1,517 @@
+package flowbot.flows
+
+import java.util.concurrent.TimeUnit
+import scala.collection.Set
+import com.bac.rctt.apps.flowbot.envelope.FlowEnvelope
+import com.bac.rctt.apps.flowbot.util.{FormatUtils, Functions}
+import org.apache.log4j.Logger
+import org.apache.spark.SparkContext
+ 
+class DAGFlow extends Flow { 
+  
+  val waitInterval = 3000
+  val flowKey = "flow.DAG."
+  val start = flowKey + "Start"
+  val end = flowKey + "End"
+  val onSuccessKey = ".onSuccess" 
+  val onFailureKey = ".onFailure" 
+  val processorKey = ".processor" 
+  val nameKey = ".name" 
+  val enabledKey = ".enabled" 
+  val dependsOnKey = ".dependsOn" 
+  val skippedKey = ".skipped" 
+  val tsStartKey = ".step_ts_start"
+  val tsEndKey = ".step_ts_end"
+  val completedKey = ".completed"
+  val slaKey = ".sla"
+  val slaRuntimeKey = ".sla_runtime"
+  val slaResultKey = ".sla_result"
+  val statusKey = ".status"
+    
+  private val uuid: String = "db64f53e-3574-4eea-a280-ec505f20558b"
+  private val logger = Logger.getLogger(getClass.getName)
+  
+  /**
+   * Runs processors in chains. The order of execution is random; the order is defined by the user by chaining the end of 
+   * a processor to the beginning of the next.
+   * @param sparkContext
+   * @param hiveContext
+   * @param flowEnvelope 
+   */
+  def run(sparkContext: SparkContext, hiveContext: org.apache.spark.sql.hive.HiveContext, flowEnvelope: FlowEnvelope) {
+      
+      logger.debug ("DAG processor loaded conf=" + flowEnvelope.getAttributes () )
+      logger.info ("Starting DAGFlow")
+      
+      val actionNames = flowEnvelope.getSteps(flowKey).keySet
+      
+      logger.info("Validating steps...")
+      validateSteps(flowEnvelope)
+      logger.info("Finished validating steps")
+    
+      processAction(start,flowEnvelope, sparkContext, hiveContext)
+    }
+  
+  
+  /**
+   * Validates that 
+   * - that all the referenced steps are present,
+   * - that there's one start and one end
+   * - that there's no cycles
+   * - that there's no disconnected nodes
+   * - that a node doesn't depend on itself, or End node
+   * - that node dependencies don't generate starvation conditions (node1 depends on node2, node2 depends on node1;
+   * 	 or node1 depends on node2, node2 depends on node3 and node3 depends on node1)
+   * @param flowEnvelope
+   * @throws exception if a necessary attribute is missing
+   */
+  def validateSteps( flowEnvelope: FlowEnvelope ): Unit = {
+      
+        logger.info("Verifying config")  
+        val steps = flowEnvelope.getSteps(flowKey).keySet    
+        logger.info("keySet: " + steps) 
+        
+        // Validate that the workflow has a starting and end point
+        var confGood : Boolean = checkMandatoryProcess(start, steps) && checkMandatoryProcess(end, steps)
+        
+        val stepsKeys = steps map(new KeyNames(_, flowEnvelope)) 
+        
+        // Validate that all referenced steps are present
+        (stepsKeys map(_.referencedSteps) reduce(_++_) distinct) foreach(confGood&=checkMandatoryProcess(_, steps))
+        
+        if (confGood){          
+          confGood &= validateExecutionTree(stepsKeys) && validateDependenciesTree(stepsKeys)          
+        }
+       
+        confGood &= validateProcesses(stepsKeys, flowEnvelope)
+        
+        if (!confGood) { throw new Exception("Errors exist in configuration file, please check the log for more information.") }
+      }
+ 
+  /**
+   * Executes the workflow. Processes will be executed only once. There's no multiple execution of a process that has already started.
+   * DAG will modify the status attribute of the process to indicate if it's executing, success or failure. 
+   * When a process fails, it will update start/end but not the SLA attributes. If a process is disabled, it will not calculate SLA
+   * DAG only works with processes, not actions. Any developer wanting to use DAG will have to modify their configuration as actions are deprecated.
+   * @param task
+   * @param flowEnvelope
+   */
+  def processAction(task: String, flowEnvelope: FlowEnvelope, sparkContext: SparkContext, hiveContext: org.apache.spark.sql.hive.HiveContext): Unit = {
+
+    var keynames = new KeyNames(task, flowEnvelope)  
+    
+    // if it's already executing it should be skipped
+    if ( flowEnvelope.hasAttribute(keynames.status) ) { return }
+    
+    flowEnvelope.setAttribute(keynames.status, "executing")
+    
+    waitForExecutionOfNeededTasks(keynames)  
+        
+    val execute: Either[List[String], List[String]] = {
+      try {
+        logger.info("Processing action: " + task)
+        
+        // WE TRY TO RUN THE TASK, IF IT'S NOT DISABLED
+        if (  keynames.taskIsDisabled ) {   
+          logger.info("found DISABLED input step! Skipping " + task)
+          flowEnvelope.setAttribute(keynames.skipped, "true")        
+        } else {  
+          flowEnvelope.setAttribute(keynames.timeStart, Functions.getCurrentMillis())
+          
+          val processor = instanceProcessor(flowEnvelope.getAttribute(keynames.processor)).asInstanceOf[ 
+                                {def run(sc: SparkContext, hiveContext: org.apache.spark.sql.hive.HiveContext, 
+                                                       flowEnvelope: FlowEnvelope, step: String): FlowEnvelope}]
+          
+          flowEnvelope.mergeAttributes(processor.run(sparkContext, hiveContext, flowEnvelope, task).getAttributes)  
+          flowEnvelope.setAttribute(keynames.timeEnd, Functions.getCurrentMillis())
+          calculateSLAs(keynames)   
+        }           
+        Right( getTaskList(flowEnvelope, keynames.onSuccess) ) 
+        
+      } catch {
+        case e: Exception => 
+          flowEnvelope.setAttribute(keynames.timeEnd, Functions.getCurrentMillis())
+          Left( getTaskList(flowEnvelope, keynames.onFailure) )        
+      }  
+    }
+          
+    // EXECUTE THE CHILDREN 
+    var tasklist : List[String] = null
+    val name = flowEnvelope.getAttribute(keynames.name)
+    var status = ""
+    
+
+    execute match {
+      case Left(lkey) => 
+        status = "failure"
+        tasklist = lkey
+      case Right(rkey) => 
+        status = "success"
+        tasklist = rkey
+    }
+    flowEnvelope.setAttribute(keynames.status, status)        
+    flowEnvelope.setAttribute(keynames.completed, "true")
+    
+    if (keynames.isEndTask) { return }
+    
+    logger.info("Node " + name + " was a " + status + ", continuing with actions: " + tasklist)    
+    tasklist.par.map(processAction(_,flowEnvelope,sparkContext,hiveContext) )
+  }
+  
+  /**
+   * Sets the SLAs of the executed processor.
+ * @param keynames
+ */
+  def calculateSLAs(keynames: KeyNames) : Unit = {
+    var envelope = keynames.container
+  
+    if (!envelope.hasAttribute(keynames.sla)) { return }
+         
+     var stepTime = envelope.getAttribute(keynames.timeEnd).toLong - envelope.getAttribute(keynames.timeStart).toLong
+     
+     var sla = FormatUtils.getTimeDuration(envelope.getAttribute(keynames.sla), TimeUnit.MILLISECONDS)
+
+     envelope.setAttribute(keynames.slaRuntime, FormatUtils.formatHoursMinutesSeconds(stepTime, TimeUnit.MILLISECONDS).toString)
+     
+     if (stepTime > sla) envelope.setAttribute(keynames.slaResult, "missed") else  envelope.setAttribute(keynames.slaResult, "made")
+
+  }
+  
+    /**
+   * @param plugin name
+   * @return an instance of the specified processor, without any casting
+   */
+  def instanceProcessor(plugin: String) : Any = {
+    return Class.forName("com.bac.rctt.apps.flowbot.processors." + plugin).newInstance
+  }
+  
+  /**   
+ * Gets the attribute from the envelope and splits it by semicolons
+ * @param envelope
+ * @param key
+ * @return a list of strings
+ */
+  def getTaskList(envelope: FlowEnvelope, key: String) : List[String] = {
+    return envelope.getAttribute(key).split(";").toList
+  }
+   
+    /**
+   * @param attribute
+   * @param flowEnvelope
+   * @return true if attribute exists. Will log an error if it doesn't.
+   */
+  def checkAttribute( attribute : String, flowEnvelope: FlowEnvelope, log : Boolean = true ): Boolean = {
+      if ( !flowEnvelope.hasAttribute(attribute) ) {
+        if (log) { logger.error("The following required attribute is missing " + attribute ) }
+        return false
+      }
+      return true
+    }
+  
+   /**
+   * @param processName
+   * @param flowEnvelope
+   * @return true if process exists. Will log an error if it doesn't.
+   */
+  def checkMandatoryProcess( processName : String, steps: Set[String]): Boolean = {
+      if (!processName.isEmpty() && !steps.contains(processName)) {
+          logger.error("DAGFlow is missing a " +processName + " process, which is required.")
+          return false
+      }
+      return true
+    }
+
+  
+  /**
+   * Waits until needed tasks have completed execution.
+   * It should be assumed that timeouts will not happen on a DAG level. So, a process will always finish and not hang infinitely.
+   * @param keyNames
+   */
+  def waitForExecutionOfNeededTasks(keyNames: KeyNames): Unit = {     
+    if (!keyNames.hasDependencies) { return }
+    
+    val envelope = keyNames.container    
+      
+    getTaskList(envelope, keyNames.dependsOn) foreach {  task =>
+      def status = { envelope.getOrDefault(task + completedKey, "false").toBoolean } 
+      
+      if (!envelope.getOrDefault(task + enabledKey, "true").toBoolean) { return }
+      
+      while (!status) {            
+        Thread.sleep(waitInterval)
+        
+        logger.info("Waiting on: " + task)
+        logger.info(task + " completed: " + status)
+      }
+      
+      logger.info("Completed: " + task)
+   }      
+    
+  }
+  
+  /**
+   * Validates the DAG execution tree: 
+   * - Starts by validating that the Start node has no dependencies on any other process and that 
+   *   no other processes are pointing to it.
+   * - Controls that the End process has no children.
+   * - If both conditions are OK, then it validates the workflow as a tree. It checks that there's no
+   *   cycles or disconnected nodes.
+   * @param stepsKeys
+   * @return true if the DAG is a directed acyclical tree with a start and end. 
+   */
+  def validateExecutionTree(stepsKeys: Set[KeyNames]) : Boolean = {
+    var tree : Map[String, GraphNode] = ( stepsKeys map(_.createNode( stepsKeys.toList )) toMap  )
+ 
+    var errMessages : List[String] = List()
+    
+    if (!tree(start).parents.isEmpty){
+      errMessages = "The following processors are pointing to Start after execution: "+ tree(start).parents :: errMessages
+    }  
+    
+    val startKeys = (stepsKeys filter(_.task == start)).head
+    if (!startKeys.getDependencies.isEmpty){
+      errMessages = "Start process shouldn't depend on any other process." :: errMessages
+    }
+    
+    if (!tree(end).children.isEmpty){
+      errMessages = "The End node shouldn't have any children processors to execute" :: errMessages
+    }     
+    if (errMessages.isEmpty){
+      !treeHasCycles(tree) && !treeHasDisconnectedBranches(tree) 
+    }else{
+      errMessages foreach(logger.error(_))
+      false
+    }
+  }
+  
+  /**
+   * Builds a dependency tree and tries to find cycles - if a cycle is found, there's a
+   * possibility of starvation. It also validates that there's no processes dependent on 
+   * the End process. 
+   * @param stepsKeys
+   * @return true if there's no possibility of starvation
+   */
+  def validateDependenciesTree(stepsKeys: Set[KeyNames]) : Boolean = {
+    var confGood : Boolean = true
+    // Validate that a node doesn't depend on End node
+    val nodesThatDependOnEnd = stepsKeys filter(_.getDependencies.contains(end))
+    if (nodesThatDependOnEnd.size > 0) {
+      logger.error("The following processors depend on the End node: " + nodesThatDependOnEnd)
+      confGood = false
+    }
+    var treeDependencies : Map[String, GraphNode] = ( stepsKeys map(_.createNodeDependencies( stepsKeys.toList )) toMap  )
+    confGood &= !treeHasCycles(treeDependencies) 
+    
+    if (confGood){ // shouldn't execute if there's cycles as there's the possibility of stack overflow
+      treeDependencies = ( stepsKeys map(_.createNodeSuccesses( stepsKeys.toList )) toMap  ) //TODO 
+      confGood &= !treeHasPotentialInfiniteWaits(treeDependencies, stepsKeys, "succeeded")
+      
+      treeDependencies = ( stepsKeys map(_.createNodeFailures( stepsKeys.toList )) toMap  )
+      confGood &= !treeHasPotentialInfiniteWaits(treeDependencies, stepsKeys, "failed")
+    }    
+    
+    confGood
+  }
+  
+  /**
+   * Has each processor instance validate the configuration for the process
+   * @param stepsKeys
+   * @param flowEnvelope
+   * @return true if all processes are well formatted
+   */
+  def validateProcesses(stepsKeys: Set[KeyNames], flowEnvelope: FlowEnvelope) : Boolean = {
+    var confGood = true
+    stepsKeys foreach { keys =>       
+          logger.info("Checking " + keys.task)           
+          
+          val plugin =  instanceProcessor(flowEnvelope.getAttribute(keys.processor)).asInstanceOf[ 
+                                          {def validate(flowEnvelope: FlowEnvelope, action: String): Boolean}]
+          
+          confGood &= plugin.validate(flowEnvelope, keys.task)
+        }
+    confGood
+  }
+  
+   /**
+   * Contains all the logic regarding atttributes for envelopes
+   */
+  class KeyNames(taskName:String, flowEnvelope: FlowEnvelope){   
+      
+      var container = flowEnvelope
+      val task = taskName
+      
+      val onSuccess = taskName + onSuccessKey
+      val onFailure = taskName + onFailureKey
+      val processor = taskName + processorKey
+      val name = taskName + nameKey
+      val enabled = taskName + enabledKey
+      val dependsOn = taskName + dependsOnKey
+      val skipped = taskName + skippedKey
+      val completed = taskName + completedKey
+      val timeEnd = taskName + tsEndKey
+      val timeStart = taskName + tsStartKey
+      val sla = taskName + slaKey
+      val slaRuntime = taskName + slaRuntimeKey
+      val slaResult = taskName + slaResultKey
+      val status = taskName + statusKey
+      
+      val isEndTask = task == end      
+      
+      val hasDependencies = checkAttribute(dependsOn, container, false)
+      
+      val getOnSuccess: String = if (checkAttribute(onSuccess, container, false)) container.getAttribute(onSuccess) else ""
+      
+      val getOnFailure: String = if (checkAttribute(onFailure, container, false)) container.getAttribute(onFailure) else ""
+      
+      val taskIsDisabled = container.getAttribute(enabled).toBoolean.equals(false) || 
+                           container.getAttribute("flow.skipSteps").contains(task)
+                           
+      val referencedSteps: List[String]  = getChildren ++ getDependencies
+                            
+      def getChildren: List[String] = { list(concatenate(getOnSuccess,getOnFailure)) }
+      
+      def getDependencies: List[String] = { if (hasDependencies) list(container.getAttribute(dependsOn)) else List() }
+      
+      def createNode(steps: List[KeyNames]) : (String,GraphNode) = {
+        val children : List[String] =  getChildren
+        val parents : List[String] = findReferences(steps)
+        (task -> new GraphNode(parents, children))
+      }
+      
+      def findReferences(steps: List[KeyNames]) : List[String] = {
+        steps filter(_.getChildren.contains(task)) map(_.task)
+      }
+                            
+      def createNodeDependencies(steps: List[KeyNames]) : (String,GraphNode) = {
+        val children : List[String] = findWhoDependsOnMe(steps)
+        val parents : List[String] = getDependencies
+        (task -> new GraphNode(parents, children))
+      }
+      
+      def findWhoDependsOnMe(steps: List[KeyNames]) : List[String] = {
+        steps filter(_.getDependencies.contains(task)) map(_.task)
+      }
+      
+      def createNodeSuccesses(steps: List[KeyNames]) : (String,GraphNode) = {
+        val children : List[String] =  list(getOnSuccess)
+        val parents : List[String] = steps filter(_.getOnSuccess.contains(task)) map(_.task)
+        (task -> new GraphNode(parents, children))
+      }
+
+      def createNodeFailures(steps: List[KeyNames]) : (String,GraphNode) = {
+        val children : List[String] =  list(getOnFailure)
+        val parents : List[String] = steps filter(_.getOnFailure.contains(task)) map(_.task)
+        (task -> new GraphNode(parents, children))
+      }
+    }
+  
+  
+  /////////////////////////////////////////////// SUPPORT METHODS FOR DAG FLOW VALIDATION ////////////////////////////////////////////////////////
+  
+  
+  /**
+   * Represents one node in a directed tree.
+   * */
+  class GraphNode(parentNames : List[String], childrenNames : List[String]) {
+    var parents : List[String] = parentNames
+    var children : List[String] = childrenNames    
+    
+    def removeReferencesNotPresent(present: List[String]) = {
+      parents = parents filter(present contains _)
+      children = children filter(present contains _)
+    }    
+  }
+
+  /**
+   * Filters out all nodes from the tree that have no parents or children recursively. It will stop when the only thing 
+   * left in the map are nodes that are creating a cycle.
+   * It will modify the nodes to remove references to the parents/children removed in each iteration.
+   * @param nodes - node list
+   * @return an empty list if no cycles are found 
+   */
+  def filterOutCycles(nodes: Map[String,GraphNode]) : Map[String,GraphNode] = {
+    var nodesToKeep = nodes filter(tuple => !tuple._2.parents.isEmpty && !tuple._2.children.isEmpty)
+    nodesToKeep foreach(node => node._2.removeReferencesNotPresent(nodesToKeep.keySet.toList))
+    if (nodesToKeep sameElements nodes) 
+       nodesToKeep
+     else 
+      filterOutCycles(nodesToKeep)
+  }
+  
+  /** 
+   * @param tree
+   * @return true if tree has cycles. If true, it will log it as an error.
+   */
+  def treeHasCycles(tree: Map[String,GraphNode]) : Boolean = {      
+      var modifiableTree : Map[String,GraphNode] = (tree toList) map(t => t._1 -> new GraphNode(t._2.parents, t._2.children) ) toMap
+      val result = filterOutCycles(modifiableTree)
+      val hasCycles = !result.isEmpty
+      if (hasCycles) { logger.error("The DAG flow specified has cycles in it - please review the dependencies for the following processes: " + result.keySet) }
+      hasCycles
+    }  
+  
+  /**
+   * Creates a string description of all the nodes that can be followed from a starting point in the
+   * tree. The string will have the format nodeName1;nodeName2;...;nodeNameN and will not have a 
+   * definite order. It will also repeat node names if there's more than one way to access the node.
+   * @param nodes
+   * @param startingPoint
+   * @return string with tree description 
+   */
+  def traverseTree(nodes: Map[String,GraphNode], startingPoint: String) : String = {
+    val children : List[String] = nodes(startingPoint).children
+    if (children.isEmpty) 
+      startingPoint 
+    else
+      startingPoint + ";" + children.map( (x) => x+";"+traverseTree(nodes,x) ).reduce(_+";"+_)
+  }
+  
+   /** 
+   * @param tree
+   * @return true if tree has disconnected branches that can't be accessed from Start node. If true, it will log it as an error.
+   */
+  def treeHasDisconnectedBranches(tree: Map[String,GraphNode]) : Boolean = {
+    val connectedNodes: List[String] = list(traverseTree(tree,start))
+    val disconnectedNodes = tree.filterNot( (entry) => connectedNodes.contains(entry._1))
+    val hasDisconnectedNodes : Boolean = disconnectedNodes.size > 0
+    if (hasDisconnectedNodes)  { logger.error("The DAG flow specified has disconnected branches - the following nodes will never be executed: " + disconnectedNodes.keySet) }
+    hasDisconnectedNodes      
+  }
+
+    /**
+   * @param tree
+   * @param steps
+   * @param status 
+   * @return true if there's dependencies on nodes that will never be executed
+   */
+  def treeHasPotentialInfiniteWaits(tree: Map[String,GraphNode], steps: Set[KeyNames], status: String) : Boolean = {
+    val connectedNodes: List[String] = list(traverseTree(tree,start))
+    val dependenciesOfConnectedNodes = steps filter( s => connectedNodes contains(s.task) ) map(_.getDependencies) reduce(_++_) distinct
+    
+    val disconnectedNodes = dependenciesOfConnectedNodes.filterNot( (entry) => connectedNodes.contains(entry))
+    val hasDisconnectedNodes : Boolean = disconnectedNodes.size > 0
+    if (hasDisconnectedNodes)  { logger.error("The DAG flow specified has paths with a potential for infinite wait. " + disconnectedNodes
+                                              + " will not be executed if the precedent tasks finish with status " + status 
+                                              + " and there's nodes in the " + status + " tree path that depend on them. Please review the dependencies of: " + connectedNodes) }
+    hasDisconnectedNodes      
+  }
+  
+  /**
+ 	* Splits a string into an array by the semicolon character and returns a list with all the distinct values.
+ 	*/
+  def list(str: String) : List[String] = { if (str.isEmpty) List() else (str split(";") distinct).toList }
+  
+  
+   /**
+    * Concatenate strings with semicolon. Empty strings are skipped.
+   * @param strings
+   * @return string in the form v1;v2;...;vn
+   */
+  def concatenate(strings: String*) : String = {
+    strings reduce({(x,y) => 
+      if (x.isEmpty) return y
+      if (y.isEmpty) return x
+      x + ";" + y
+    })
+  }
+}
