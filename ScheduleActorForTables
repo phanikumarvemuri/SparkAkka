@@ -1,0 +1,65 @@
+package com.bac.rctt.apps.flowbot.util
+
+/**
+ *
+ * This code is used to fetch the sqlLiteral or sqlFile from configuration file
+ * and execute those HQL's and return the dataframeEnvelope.
+ *
+ *   Date             Developer                         Change
+ * ========= ========================== ==============================================
+ * 12-Sept-17			Vemuri,PhaniKumar        Implemented parallelism for exports/Imports to Database
+ */
+
+import java.util.ArrayList
+
+import akka.actor.{ Actor, ActorRef, Props }
+import org.apache.log4j.Logger
+
+case class ScheduleActorForTables(maxConnections: Int, maxConnectionsPerTable: Int) extends Actor {
+  val logger: Logger = Logger.getLogger(getClass.getName)
+  var workers: ArrayList[ActorRef] = new ArrayList[ActorRef]();
+
+  override def preStart(): Unit = {
+    for (i <- 0 until maxConnections / maxConnectionsPerTable) {
+      workers.add(context.system.actorOf(Props(new com.bac.rctt.apps.flowbot.util.Worker(maxConnectionsPerTable))))
+      logger.info("starting workers : " + workers.size())
+    }
+  }
+
+  def receive = {
+    case message: ActorMessage => {
+      var worker = workers.remove(0)
+      worker ! message
+      workers.add(worker)
+
+    }
+    case message: ActorMessageForWrite => {
+      var worker = workers.remove(0)
+      worker ! message
+      workers.add(worker)
+
+    }
+
+    case message: SuccessInfo => {
+
+      message.returncode match {
+        case 1 =>
+          logger.error("Failed extracting the table/query " + message.flowEnvelope.getAttribute(message.step + ".table"))
+          throw new Exception("Failed importing the data for table/query " + message.flowEnvelope.getAttribute("flow.status.message"))
+        case 0 => logger.info("Completed extracting the table/query " + message.flowEnvelope.getAttribute(message.step + ".table"))
+      }
+
+    }
+
+    case message: SuccessInfoForWrite => {
+
+      message.returncode match {
+        case 1 =>
+          logger.error("Failed exporting the table/query " + message.flowEnvelope.getAttribute(message.step + ".table"))
+          throw new Exception("Failed exporting the data for table/query " + message.flowEnvelope.getAttribute("flow.status.message"))
+        case 0 => logger.info("Completed exporting the table/query " + message.flowEnvelope.getAttribute(message.step + ".table"))
+      }
+
+    }
+  }
+}
