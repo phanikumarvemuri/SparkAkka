@@ -1,0 +1,28 @@
+package com.bac.rctt.apps.flowbot.util
+
+import com.bac.rctt.apps.flowbot.envelope.FlowEnvelope
+
+//import java.util.stream.Nodes.ToArrayTask
+
+case class ActorMessage(hiveContext: org.apache.spark.sql.hive.HiveContext, flowEnvelope: FlowEnvelope, step: String, counter: org.apache.spark.Accumulator[Int]) {
+
+}
+
+
+
+ActorMessageForWrite
+
+
+
+package com.bac.rctt.apps.flowbot.util
+
+import com.bac.rctt.apps.flowbot.envelope.FlowEnvelope
+
+//import java.util.stream.Nodes.ToArrayTask
+
+case class ActorMessageForWrite(hiveContext: org.apache.spark.sql.hive.HiveContext, flowEnvelope: FlowEnvelope, step: String, counter: org.apache.spark.Accumulator[Int]) {
+
+}
+
+
+
