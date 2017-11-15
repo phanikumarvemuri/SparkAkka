@@ -1,0 +1,112 @@
+package logging;
+
+import org.apache.hadoop.fs.Path;
+
+/**
+ * This is a Dummy Logger that will only provide implementations for methods of HadoopLogger interface.
+ * If there are any exceptions in obtaining the AlpideHadoopLogger then DummyHadoopLogger will be 
+ * provided by the HadoopLogFactory. 
+ * @author 
+ *
+ */
+
+public class DummyHadoopLogger implements HadoopLogger {
+
+	private static final long serialVersionUID = 2618272581849172882L;
+
+	@Override
+	public void exception(String subStage,String message){}
+
+	@Override
+	public void debug(String subStage,String message){}
+
+	@Override
+	public void info(String subStage,String message){}
+
+	@Override
+	public void warn(String subStage,String message){}
+
+	@Override
+	public void log(HADOOPLOGTYPE messageType, String subStage,String sourceName, String message) {}
+
+	
+	@Override
+	public Path getFileName() {
+		throw new IllegalArgumentException("This is a Dummy implementation. The method is not supported.");
+	}
+
+	@Override
+	public void warn(String subStage, Throwable message) {}
+
+	@Override
+	public String getName() {
+		return "DummyLogger";
+	}
+
+	@Override
+	public void exception(String subStage, String tableNameorFileName, String message) {}
+
+	@Override
+	public void debug(String subStage, String tableNameorFileName, String message) {}
+
+	@Override
+	public void info(String subStage, String tableNameorFileName, String message) {}
+
+	@Override
+	public void warn(String subStage, String tableNameorFileName, String message) {}
+
+	@Override
+	public void warn(String subStage, String tableNameorFileName, Throwable message) {}
+
+	@Override
+	public void exception(String subStage, String tableNameorFileName, Throwable message) {}
+
+	@Override
+	public void log(HADOOPLOGTYPE messageType, String subStage,
+			String sourceName, String message, String tablenameorFileName) {}
+
+	@Override
+	public void abend(String subStage, String message) {}
+
+	@Override
+	public void abend(String subStage, String tableNameorFileName,String message) {}
+	
+	@Override
+	public void event(String subStage, String tableNameorFileName,String message) {}
+
+	@Override
+	public void exception(String subStage, String tableNameorFileName,
+			String message, Throwable throwable) {}
+
+	@Override
+	public void close() throws Exception {}
+
+	@Override
+	public void setControlPoint(String controlPoint) {}
+
+	@Override
+	public void setProduct(String product) {}
+
+	@Override
+	public void log(HADOOPLOGTYPE messageType, String subStage, String message) {}
+
+	@Override
+	public void logSummary(HADOOPLOGTYPE messageType, String tableNameorFileName) {}
+
+	@Override
+	public void logLineageSummary(String applicationId, String subStage, String lineageMessage) {
+	}
+
+	@Override
+	public void logLineageDetail(String applicationId, String subStage, String lineageMessage) {				
+	}
+
+	@Override
+	public boolean isLogLineageMessage() {
+		// TODO Auto-generated method stub
+		return false;
+	}
+
+	@Override
+	public void setStage(String stage) {}
+}
