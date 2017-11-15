@@ -1,0 +1,298 @@
+package flowbot.processors
+
+/**
+ * This code is used to fetch the sqlLiteral or sqlFile from configuration file 
+ * and Import Data from RDBMS and load it into the Hadoop File System
+ *
+ * Example HOCON that can be used to call the GetRDBMS Plugin:
+ * 
+ *   step-0001 {
+        type=input
+        name=mySqlData
+        action=getRDBMS
+        enabled=true
+        dbtype="mySQL"
+        username=root
+        password=jceks://file/src/test/resources/junit.jceks"
+    	alias=junit.hsql.alias
+        hostname=localhost
+        port=3306
+        database=hue
+	    sqlLiteral="select * from users"
+        driver=com.mysql.jdbc.Driver
+        table=test
+        rowCountEst=100
+        policy="policies.default"
+        sla=10 mins
+        validateCounts=true
+        sumcheckcolumns=user
+    	sumcheckprecision=10,3       
+    }
+ * 
+ *   Date             Developer                         Change
+ * ========= ========================== ==============================================
+ * 16-Aug-17          Joe Trite                  Initial Version
+ * 17-Aug-17         Sundarrajan Raman          Integrated with HDPF Sequence Generator's pipeline method 
+ * 																				with option
+ *                                       	 	Removed policy file check.
+ *                                       		Added Sum Check for RDBMS Sourcing
+ *                                       		Added Precision in Sum Check
+ *                                       		Added Hadoop Credential API for passsword encryption
+ */
+
+import akka.actor.{ ActorSystem, Props }
+import com.bac.rctt.apps.flowbot.envelope.FlowEnvelope
+import com.bac.rctt.apps.flowbot.util.{ ActorMessage, ScheduleActorForTables }
+import org.apache.spark.SparkContext
+import com.bac.rctt.apps.flowbot.envelope.DataFrameEnvelope
+import org.apache.spark.sql.DataFrame
+import org.apache.spark.api.java.JavaSparkContext
+import com.bac.ecr.hdf.components.keygenerator.driver.KeyGenerator;
+import com.bac.ecr.hdf.components.keygenerator.service.KeyGeneratorService;
+import com.bac.ecr.hdf.components.keygenerator.utils.KeyGeneratorConstants;
+import com.bac.ecr.hdf.components.keygenerator.utils.KeyGeneratorException;
+import com.bac.ecr.hdf.components.keygenerator.utils.KeyGeneratorUtils;
+import com.bac.ecr.hdf.components.utils.commonutils.SchemaOperationsUtil
+
+import org.apache.spark.api.java.JavaSparkContext
+import com.bac.ecr.hdf.frameworks.logging._
+import com.bac.ecr.hdf.frameworks.logging.HadoopLogFactory
+import com.bac.ecr.hdf.frameworks.logging.HadoopLogger
+import com.bac.ecr.hdf.frameworks.logging.DummyHadoopLogger
+import com.bac.ecr.hdf.frameworks.logging.HadoopLogger.DDI_LAYER
+import com.bac.ecr.hdf.frameworks.logging.HadoopLogger.HADOOPLOGTYPE
+import java.util.concurrent.atomic.AtomicInteger
+import scala.util.control.Exception.Catch
+
+
+class GetRDBMS() extends BaseProcessor {
+  def run(sc: SparkContext, hiveContext: org.apache.spark.sql.hive.HiveContext, flowEnvelope: FlowEnvelope, step: String): FlowEnvelope = {
+    implicit var counter = sc.accumulator(0)
+    var numTables: Int = 0
+    var sqlQuery: String = {
+      if (flowEnvelope.hasAttribute(step + ".sqlLiteral")) {
+        flowEnvelope.getAttribute(step + ".sqlLiteral")
+      } else {
+        hdfsFileAsString(flowEnvelope.getAttribute(step + ".sqlFile"), flowEnvelope)
+      }
+    }
+    val system = ActorSystem("Main")
+    logger.info("Creating Actors")
+    val actor = system.actorOf(Props(ScheduleActorForTables(flowEnvelope.getOrDefault(step + ".maxConnections", 1).toInt, flowEnvelope.getOrDefault(step + ".maxConnectionsPerTable", 1).toInt)))
+
+    var subStepNumber = 1
+
+    sqlQuery.trim().split(";").foreach(query => {
+      logger.info("******Item to execute:" + query.trim())
+      var newstep = step + "-" + subStepNumber
+      logger.info("New Step Name:" + newstep)
+      var sqlQuery = query.trim().substring(0, query.trim().lastIndexOf(" "))
+      var sqlDatasetName = query.trim().substring(query.trim().lastIndexOf(" ") + 1, query.trim().length())
+      if (sqlQuery.toLowerCase().contains("from")) {
+        sqlQuery = "( " + sqlQuery + " ) " + sqlDatasetName
+      }
+      var sqlCountQuery = "(select cast(count(*) as Int) as cnt from " + sqlQuery + ") t2"
+
+      logger.info("Query to execute:" + sqlQuery)
+      logger.info("Count validation query to execute:" + sqlCountQuery)
+      logger.info("Dataset will be named:" + sqlDatasetName)
+
+      flowEnvelope.cloneAttributes(step, newstep)
+
+      flowEnvelope.setAttribute(newstep + ".name", sqlDatasetName)
+      flowEnvelope.setAttribute(newstep + ".table", sqlQuery)
+      flowEnvelope.setAttribute(newstep + ".integrityCheckQuery", sqlCountQuery)
+      
+      processSumCheckAttributes(flowEnvelope, step, sqlDatasetName, newstep, sqlQuery)
+
+      val stepContainsPartitionedDatasets: Boolean = flowEnvelope.hasAttribute(step + ".partitionedDatasets")
+      val partitionedDatasets: String = flowEnvelope.getAttribute(step + ".partitionedDatasets")
+      var currentDatasetContainsParitions = false
+      if (stepContainsPartitionedDatasets && partitionedDatasets.contains(sqlDatasetName)) {
+          currentDatasetContainsParitions = true
+          logger.info("This dataset is partitioned.")
+
+          flowEnvelope.setAttribute(newstep + ".isPartitioned", "true")
+
+        partitionedDatasets.split(",").map(partitionedDatasetItem => {
+          if (partitionedDatasetItem.contains(sqlDatasetName)) {
+            flowEnvelope.setAttribute(newstep + ".partitionColumn", partitionedDatasetItem.trim().split(" ")(1))
+            flowEnvelope.setAttribute(newstep + ".lowerBound", partitionedDatasetItem.trim().split(" ")(2))
+            flowEnvelope.setAttribute(newstep + ".upperBound", partitionedDatasetItem.trim().split(" ")(3))
+
+            logger.info("partition column:" + flowEnvelope.getAttribute(newstep + ".partitionColumn"))
+            logger.info("partition lowerBound:" + flowEnvelope.getAttribute(newstep + ".lowerBound"))
+            logger.info("partition upperBound:" + flowEnvelope.getAttribute(newstep + ".upperBound"))
+            logger.info("partition number:" + flowEnvelope.getAttribute(newstep + ".maxConnectionsPerTable"))
+
+          }
+        })
+      }
+
+      /*flowEnvelope.mergeAttributes(getRDBMS(hc, flowEnvelope, newstep).getAttributes())
+      flowEnvelope.checkQuality(newstep)*/
+      actor ! ActorMessage(hiveContext, flowEnvelope, newstep, counter)
+      numTables += 1
+      subStepNumber += 1
+      Thread.sleep(3000)
+
+    })
+
+    while (counter.value < numTables) {
+      Thread.sleep(1000);
+      logger.info("waiting on tables to complete.")
+      logger.info("counter.value=" + counter.value + " table count=" + numTables)
+    }
+    system.shutdown()
+
+    flowEnvelope
+  }
+  
+  def processSumCheckAttributes(flowEnvelope: FlowEnvelope, step: String, sqlDatasetName: String, newstep:String, sqlQuery:String) :Unit = {          
+      var sumQuery = "( select "
+      var sumColumnsQuery = ""
+      var sumColumnsDataset = ""
+      var sumCheckColumCount: AtomicInteger = new AtomicInteger(0)
+      
+      if (flowEnvelope.hasAttribute(step + ".sumcheckcolumns"  )){
+        sumColumnsQuery = ""
+        sumColumnsDataset = ""
+        sumQuery = "( select "
+        sumCheckColumCount = new AtomicInteger(0)
+        
+        logger.info("**********" + flowEnvelope.getAttribute(step + ".sumcheckcolumns"  ))
+        val stepContainssumCheckColumns: Boolean = flowEnvelope.hasAttribute(step + ".sumcheckcolumns"  )
+        val sumCheckColumns: String = flowEnvelope.getAttribute(step + ".sumcheckcolumns"  )         
+        if (stepContainssumCheckColumns && sumCheckColumns.contains(sqlDatasetName)) {
+          sumCheckColumns.split(",").map(sumCheckItems => {
+            logger.info("*****Doing sum check using " + sumCheckItems)
+            logger.info("Comparing " + sumCheckItems.split("\\W+")(0) + " with ::::" +  sqlDatasetName)
+            if (sumCheckItems.split("\\W+")(0) == sqlDatasetName) {
+              logger.info("******* Found Sumcheck for " + sqlDatasetName)
+              val sumCheckColumns = sumCheckItems.split("\\W+")
+              val sumCheckColumCount = sumCheckItems.split("\\W+").length
+              flowEnvelope.setAttribute(newstep + ".sumCheckColumns", sumCheckItems.split("\\W+")(1))             
+              for (i <- 1 to sumCheckItems.split("\\W+").length-1){                
+                if (sumColumnsQuery.equals("")){
+                  sumColumnsQuery = sumColumnsQuery + "SUM(cast(" + sumCheckColumns(i) + " as decimal(38,10))) as " + sumCheckColumns(i) + "_SUM"
+                  sumColumnsDataset =  sumCheckColumns(i)
+                }else{
+                  sumColumnsQuery = sumColumnsQuery + " , SUM(cast(" + sumCheckColumns(i) + " as decimal(38,10))) as " + sumCheckColumns(i) + "_SUM"
+                  sumColumnsDataset = sumColumnsDataset + "," + sumCheckColumns(i)
+                }                
+              }                            
+              sumQuery = sumQuery + sumColumnsQuery + " from " + sqlQuery + ") s2"  
+            }
+          })
+          
+        }
+      }
+      logger.info("************" + sumQuery)
+
+      if(! (sumColumnsQuery == "") ){        
+        flowEnvelope.setAttribute(newstep + ".sumCheckQuery", sumQuery)
+        flowEnvelope.setAttribute(newstep + ".sumCheckDataFrameExpression", sumColumnsDataset)
+        flowEnvelope.setAttribute(newstep + ".sumCheckColumCount", sumCheckColumCount.toString())
+      }
+
+  }
+  
+
+
+  override def validate(flowEnvelope: FlowEnvelope, step: String): Boolean = {
+    logger.info("Verifying " + step)
+    var confGood = super.validate(flowEnvelope: FlowEnvelope, step: String)
+
+    for (attribute <- Set("dbtype", "username", "password", "driver",  "hostname")) {
+      if (!flowEnvelope.hasAttribute(step + "." + attribute)) {
+        logger.error(step + " is missing attribute " + attribute + ", which is required for action getRDBMS")
+        confGood = false
+      }
+    }
+    if (!flowEnvelope.hasAttribute(step + ".sqlLiteral") && !flowEnvelope.hasAttribute(step + ".sqlFile")) {
+      logger.error(step + " is missing both sqlLiteral and sqlFile. One of the two must be defined for action getRDBMs.")
+      confGood = false
+    }
+    if (flowEnvelope.hasAttribute(step + ".sqlLiteral") && flowEnvelope.hasAttribute(step + ".sqlFile")) {
+      logger.error(step + " has attribute sqlLiteral and sqlFile. Only one can be defined for action getRDBMs.")
+      confGood = false
+    }
+    if (flowEnvelope.getAttribute(step + ".dbtype") != "teradata") {
+      if (!flowEnvelope.hasAttribute(step + ".port")) {
+        logger.error(step + " is missing attribute port, which is required for dbtype teradata.")
+        confGood = false
+      }
+    }
+    if (!(Set("teradata", "sqlserver") contains flowEnvelope.getAttribute(step + ".dbtype"))) {
+      if (!flowEnvelope.hasAttribute(step + ".database")) {
+        logger.error(step + " is missing attribute port, which is required if dbtype is not teradata or sqlserver.")
+        confGood = false
+      }
+    }
+    
+    if (flowEnvelope.hasAttribute(step + ".maxConnections") && !flowEnvelope.hasAttribute(step + ".maxConnectionsPerTable")) {
+      logger.error(step + " has attribute maxConnections but is missing maxConnectionsPerTable.")
+      confGood = false
+    }
+    
+    if (flowEnvelope.hasAttribute(step + ".maxConnectionsPerTable") && !flowEnvelope.hasAttribute(step + ".maxConnections")) {
+      logger.error(step + " has attribute maxConnectionsPerTable but is missing maxConnections.")
+      confGood = false
+    }
+    
+    if (flowEnvelope.hasAttribute(step + ".maxConnectionsPerTable") && flowEnvelope.hasAttribute(step + ".maxConnections")) {
+    if (flowEnvelope.getAttribute(step + ".maxConnectionsPerTable").toInt > flowEnvelope.getAttribute(step + ".maxConnections").toInt) {
+      logger.error(step + ": maxConnectionsPerTable cannot exceed maxConnections.")
+      confGood = false
+    }}
+    
+    //Sum Check Validation
+    if (flowEnvelope.hasAttribute(step + ".sumcheckcolumns")) {
+        //get the Sum Check value
+        val sumCheckColumnValue = flowEnvelope.getAttribute(step + ".sumcheckcolumns")
+        if (sumCheckColumnValue.trim() == ""){
+          logger.error(step + " contains invalid sumcheckcolumns attribute value= "+ sumCheckColumnValue +"  Expected format: sumcheckcolumns=<datasetname> <split-by column name>. For example: sumcheckcolumns=user age salary,loans balanaceAmount principle" )
+            confGood = false
+        }
+         sumCheckColumnValue.split(",").map(sumCheckItems => {
+           val sumCheckDatasetLength = sumCheckItems.split("\\W+").length
+           if (sumCheckDatasetLength < 2 || sumCheckItems.split("\\W+")(0).trim() == "" || sumCheckItems.split("\\W+")(1).trim() == ""){
+            logger.error(step + " contains invalid sumcheckcolumns attribute value="+ sumCheckColumnValue +" Expected format: sumcheckcolumns=<datasetname> <split-by column name>. For example: sumcheckcolumns=user age salary,loans balanaceAmount principle" )
+            confGood = false
+           }
+         })
+    }
+    
+    //sumCheckPrecisionvalidation
+    if (flowEnvelope.hasAttribute(step + ".sumcheckprecision")) {       
+        val sumCheckPrecisionValue = flowEnvelope.getAttribute(step + ".sumcheckprecision")
+        if (sumCheckPrecisionValue.trim() == ""){
+          logger.error(step + " contains invalid sumcheckprecision attribute value= "+ sumCheckPrecisionValue +"  Expected format: sumcheckprecision=precision,scale Example;sumcheckprecision=10,2 The values should of Integers only." )
+          confGood = false
+        }
+        if (sumCheckPrecisionValue.split(",").length != 2){
+          logger.error(step + " contains invalid sumcheckprecision attribute value= "+ sumCheckPrecisionValue +"  Expected format: sumcheckprecision=precision,scale Example;sumcheckprecision=10,2 The values should of Integers only." )
+          confGood = false          
+        }
+        
+        try{
+          sumCheckPrecisionValue.split(",")(0).toInt
+          sumCheckPrecisionValue.split(",")(1).toInt
+        }catch{
+          case numberFormat: NumberFormatException => 
+                logger.error(step + " contains invalid sumcheckprecision attribute value= "+ sumCheckPrecisionValue +"  Expected format: sumcheckprecision=precision,scale Example;sumcheckprecision=10,2 The values should of Integers only." )
+                confGood = false      
+        }      
+          
+    }
+    
+      if (flowEnvelope.hasAttribute(step + ".autoSavePath")) {
+        if(!flowEnvelope.hasAttribute(step + ".autoSaveFormat") || !flowEnvelope.hasAttribute(step + ".autoSaveSaveMode")) {
+        logger.error(step + " is missing required attributes.  If autoSavePath is specified then autoSaveFormat and autoSaveSaveMode must also be specified.")
+        confGood = false
+      }
+    }
+
+    confGood
+  }
+}
