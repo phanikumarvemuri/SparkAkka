@@ -1,0 +1,68 @@
+package flowbot.processors
+
+import com.bac.rctt.apps.flowbot.envelope.{DataFrameEnvelope, FlowEnvelope}
+import org.apache.spark.SparkContext
+
+
+class GetParquetData() extends BaseProcessor{
+  def run(sc: SparkContext, hiveContext: org.apache.spark.sql.hive.HiveContext, flowEnvelope: FlowEnvelope, step: String): FlowEnvelope = {
+    var getList: String = {
+      if (flowEnvelope.hasAttribute(step + ".getListLiteral")) {
+        flowEnvelope.getAttribute(step + ".getListLiteral")
+      } else {
+        hdfsFileAsString(flowEnvelope.getAttribute(step + ".getListFile"), flowEnvelope)
+      }
+    }
+
+    var subStepNumber = 1
+
+    getList.trim().split(";").foreach(listItem => {
+      logger.info("List item to execute:" + listItem)
+      var newstep = step + "-" + subStepNumber
+      logger.info("New Step Name:" + newstep)
+      var listItemLocation = listItem.substring(0, listItem.lastIndexOf(" ")).trim().replace("\n", "")
+      var listItemDatasetName = listItem.substring(listItem.lastIndexOf(" ") + 1, listItem.length()).trim().replace("\n", "")
+
+      flowEnvelope.cloneAttributes(step, newstep)
+
+      logger.info("List item datasetName:" + listItemDatasetName)
+      logger.info("List item location:" + listItemLocation)
+
+      flowEnvelope.setAttribute(newstep + ".name", listItemDatasetName)
+      flowEnvelope.setAttribute(newstep + ".location", listItemLocation)
+
+      logger.info("found getParquetData step! Going to pass '" + newstep + "' to sp.getParquetFile")
+      flowEnvelope.mergeAttributes(getParquetFile(hiveContext, flowEnvelope, newstep).getAttributes())
+     // flowEnvelope.checkQuality(newstep)
+
+      subStepNumber += 1
+    })
+
+    flowEnvelope
+  }
+
+  def getParquetFile(hiveContext: org.apache.spark.sql.hive.HiveContext, flowEnvelope: FlowEnvelope, step: String): DataFrameEnvelope = {
+    logger.info("Running getParquetFile")
+    val envelope = new DataFrameEnvelope(step)
+    envelope.setAttribute(step + ".function-uuid", "f685341d-0438-42af-b22c-77cd66c18cf7")
+    envelope.mergeAttributes(flowEnvelope.getAttributes())
+    envelope.setDataFrame(hiveContext.read.load(envelope.getAttribute(step + ".location")))
+    envelope
+  }
+
+  override def validate(flowEnvelope: FlowEnvelope, step: String): Boolean = {
+    logger.info("Verifying " + step)
+    var confGood = super.validate(flowEnvelope: FlowEnvelope, step: String)
+
+    if (!flowEnvelope.hasAttribute(step + ".getListLiteral") && !flowEnvelope.hasAttribute(step + ".getListFile")) {
+      logger.error(step + " is missing both getListLiteral and getListFile. One of the two must be defined for action getParquetData.")
+      confGood = false
+    }
+    if (flowEnvelope.hasAttribute(step + ".getListLiteral") && flowEnvelope.hasAttribute(step + ".getListFile")) {
+      logger.error(step + " has attribute getListLiteral and getListFile. Only one can be defined for action getParquetData.")
+      confGood = false
+    }
+
+    confGood
+  }
+}
