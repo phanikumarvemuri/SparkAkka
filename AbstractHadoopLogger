@@ -1,0 +1,556 @@
+
+package logging;
+
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.io.StringWriter;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.List;
+import java.util.Random;
+
+import org.apache.commons.lang.builder.EqualsBuilder;
+import org.apache.commons.lang.builder.HashCodeBuilder;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+import org.apache.log4j.Logger;
+
+import logging.HadoopLogger.HADOOPLOGTYPE;
+
+/**
+ * Abstract Logger class to abstract out all the common functionalities of all the Logger
+ * @author 
+ *
+ */
+
+public abstract class AbstractHadoopLogger implements HadoopLogger {
+	
+
+	private static final long serialVersionUID = -3501079186390214995L;
+
+	private static final Logger log4jLogger = Logger.getLogger(AbstractHadoopLogger.class);
+		
+	private String name;
+	private String stage;
+	private String product;
+	private boolean initialized;
+	private Path dataFile;
+	private String schemaPath;
+	private String baseLogPath;
+	private String application;
+	private String controlPoint;
+	private HADOOPLOGTYPE logLevel = HADOOPLOGTYPE.INFO;
+	private Configuration conf;
+	private List<HadoopLog> logs = new ArrayList<>(100);
+	private boolean logLineageMessage;
+	private String runId;
+	
+
+	AbstractHadoopLogger(String aBaseLogPath,
+						String anApplication,
+						String aName, 
+						String aProduct, 
+						String aStage, 
+						String aLogSchemaPath,
+						String aLogLevel,
+						String aControlPoint,
+						Boolean aLogLineageMessage,
+						String aRunId,
+						Configuration aConf) throws IOException {
+		name = aName;
+		stage = aStage;
+		product = aProduct;	
+		schemaPath = aLogSchemaPath;
+		baseLogPath = aBaseLogPath;
+		application = anApplication;
+		conf = aConf;
+		dataFile = getUniquePath();
+		controlPoint = aControlPoint;
+		logLevel = HADOOPLOGTYPE.getLogLevelFromStringValue(aLogLevel, logLevel);
+		logLineageMessage = aLogLineageMessage;
+		runId = aRunId;
+		log4jLogger.info(dataFile.getName());
+		log4jLogger.info("Configuration obtained:" + aConf );
+	}
+	
+	
+	AbstractHadoopLogger(String aBaseLogPath,
+			String anApplication,
+			String aName, 
+			String aProduct, 
+			String aStage, 
+			String aLogSchemaPath,
+			String aLogLevel,
+			String aControlPoint,
+			Boolean aLogLineageMessage,
+			
+			Configuration aConf) throws IOException {
+		name = aName;
+		stage = aStage;
+		product = aProduct;	
+		schemaPath = aLogSchemaPath;
+		baseLogPath = aBaseLogPath;
+		application = anApplication;
+		conf = aConf;
+		dataFile = getUniquePath();
+		controlPoint = aControlPoint;
+		logLevel = HADOOPLOGTYPE.getLogLevelFromStringValue(aLogLevel, logLevel);
+		logLineageMessage = aLogLineageMessage;
+		log4jLogger.info(dataFile.getName());
+		log4jLogger.info("Configuration obtained:" + aConf );
+	}
+		
+	protected abstract void initialize() throws IOException;
+	protected abstract String getLogFileExtension();
+	protected abstract void buildDatumAndLog(String application,
+											String product, 
+											HADOOPLOGTYPE messageType, 
+											String stage, 
+											String subStage,
+											String fileTableName,
+											String sourceName,
+											String controlPoint,
+											String runID,
+											String message);
+	public abstract void close()  throws Exception;
+	
+	 Random rand = new Random();
+	
+	 public static int randInt(int min, int max) {
+
+		    // NOTE: Usually this should be a field rather than a method
+		    // variable so that it is not re-seeded every call.
+		    Random rand = new Random();
+
+		    // nextInt is normally exclusive of the top value,
+		    // so add 1 to make it inclusive
+		    int randomNum = rand.nextInt((max - min) + 1) + min;
+
+		    return randomNum;
+		}
+	
+	protected Path getUniquePath() throws IOException {
+		StringBuilder parentFolder = new StringBuilder();
+		parentFolder.append(getBaseLogPath())									
+					.append("/layer=")
+					.append(getStage())
+					.append("/")
+					.append("currdate=")
+					.append(new SimpleDateFormat("yyyyMMdd").format(new Date()));
+		
+		String fileName = getName().replace(" ", "_");
+		fileName = fileName + "_" + new Date().getTime()  + getLogFileExtension();
+		
+		Path avroPath = new Path(parentFolder.toString(), fileName);
+		log4jLogger.info("AvroPath:" + avroPath);
+		avroPath.getFileSystem(getConfig()).mkdirs(new Path(parentFolder.toString()));
+		/*while(avroPath.getFileSystem(conf).exists(avroPath)){
+			fileCounter++ ;
+			fileName = name + "_" + fileCounter + AVRO_EXTN;
+			avroPath = new Path(parent, fileName);
+		}*/		
+		return avroPath;		
+	}
+	
+	/**
+	 * Log method to Log the messages. Does lazy initialization for initializing the Log file.
+	 * 
+	 */
+	
+	@Override
+	public void log(HADOOPLOGTYPE messageType, String subStage, String sourceName, String message) {
+		log(messageType, subStage, sourceName, "", message);
+		
+	}
+	
+	
+	/**
+	 * Log method to Log the messages. Does lazy initialization for initializing the Log file.
+	 * 
+	 */
+	
+	@Override
+	public void log(HADOOPLOGTYPE messageType, String subStage, String message) {
+		log(messageType, subStage, "", "", message);
+		
+	}
+	
+
+	@Override
+	public void log(HADOOPLOGTYPE messageType, String subStage, 
+					String sourceName, String tableNameorFileName, 
+					String message) {
+		//Lazy initialization to create the files only if there are any logs coming in.		
+		if (! isInitialized()){
+			try{				
+				initialize();				
+			}catch(Exception e){
+				e.printStackTrace();
+			}
+		}
+		
+		if (messageType.getLevel() >= getLogLevel().getLevel() ){
+						
+			if (logs.size() < 1000){
+				logs.add(new HadoopLog(getApplication(),
+								getProduct(),
+								messageType,
+								getStage(),
+								subStage,
+								tableNameorFileName,
+								getName(),
+								getControlPoint(),
+								message,
+								getRunId()));
+			}
+			
+			buildDatumAndLog(
+							getApplication(),
+							getProduct(),
+							messageType,
+							getStage(),
+							subStage,
+							tableNameorFileName,
+							getName(),
+							getControlPoint(),
+							getRunId(),
+							message);
+		}
+		
+	}
+	
+	@Override
+	public void debug(String subStage,String message) {
+		log(HADOOPLOGTYPE.DEBUG,subStage,getName(),message);
+	}
+	
+	@Override
+	public void debug(String subStage, String tableNameorFileName, String message) {
+		log(HADOOPLOGTYPE.DEBUG,subStage,getName(),tableNameorFileName,message);
+	}
+	
+
+	@Override
+	public void info(String subStage, String message){		
+		log(HADOOPLOGTYPE.INFO,subStage,getName(),message);
+	}
+	
+	@Override
+	public void info(String subStage, String tableNameorFileName, String message){		
+		log(HADOOPLOGTYPE.INFO,subStage,getName(),tableNameorFileName,message);
+	}
+	
+
+	@Override
+	public void warn(String subStage,String message){
+		log(HADOOPLOGTYPE.WARN,subStage,getName(),message);
+	}
+	
+	@Override
+	public void warn(String subStage, String tableNameorFileName, String message){
+		log(HADOOPLOGTYPE.WARN,subStage,getName(),tableNameorFileName,message);
+	}
+	
+	
+	@Override
+	public void warn(String subStage,Throwable throwable){		
+		log(HADOOPLOGTYPE.WARN,subStage,getName(), convertThrowableToString(throwable));
+	}
+	
+	@Override
+	public void warn(String subStage,String tableNameorFileName, Throwable throwable){		
+		log(HADOOPLOGTYPE.WARN,subStage,getName(),tableNameorFileName, convertThrowableToString(throwable));
+	}
+	
+	
+	@Override
+	public void exception(String subStage, String message, Throwable throwable){
+		log(HADOOPLOGTYPE.EXCEPTION, subStage, getName() , "" , message + convertThrowableToString(throwable));
+	}
+	
+	@Override
+	public void exception(String subStage, String tableNameorFileName, String message, Throwable throwable){
+		log(HADOOPLOGTYPE.EXCEPTION, subStage, getName() ,tableNameorFileName ,message + convertThrowableToString(throwable));
+	}
+	
+	
+	@Override
+	public void exception(String subStage,String message)  {
+		log(HADOOPLOGTYPE.EXCEPTION,subStage,getName(), "" ,message);
+	}
+	
+	@Override
+	public void exception(String subStage, String tableNameorFileName, String message)  {
+		log(HADOOPLOGTYPE.EXCEPTION,subStage,getName(),tableNameorFileName,message);
+	}
+	
+	@Override
+	public void abend(String subStage, String message){
+		log(HADOOPLOGTYPE.ABEND,subStage,getName(),message);
+		System.exit(1);
+	}
+	
+	@Override
+	public void abend(String subStage, String tableNameorFileName, String message){
+		log(HADOOPLOGTYPE.ABEND,subStage,getName(),tableNameorFileName,message);
+		System.exit(1);
+	}
+	
+	@Override
+	public void event(String subStage, String tableNameorFileName, String message){
+		log(HADOOPLOGTYPE.EVENT,subStage,getName(),tableNameorFileName,message);
+	}
+	
+
+	public int getDefaultLogLevel() {return HADOOPLOGTYPE.INFO.getLevel();}
+	public void setLogLevel(HADOOPLOGTYPE logLevel) {this.logLevel = logLevel;}
+	public HADOOPLOGTYPE getLogLevel() {return logLevel;}
+	public String getName() {return name;}
+	public void setName(String name) {this.name = name;}
+	public Path getFileName(){return dataFile;}
+	public String getSchemaPath(){return schemaPath;}
+	protected boolean isInitialized(){return initialized;}
+	protected void markInitialized(){initialized = true;}
+	protected synchronized void unInitialize(){initialized = false;}
+	protected String getBaseLogPath(){return baseLogPath;}
+	protected String getApplication(){return application;}
+	protected String getProduct(){return product;}
+	protected String getStage(){return stage;}
+	protected String getControlPoint(){return controlPoint;}
+	protected String getRunId(){return runId;}
+	protected Configuration getConfig(){return conf;}
+	
+	
+	
+	@Override
+	public boolean equals(Object obj){
+		if (obj == null) return false;
+		if (!(obj instanceof HDFSAvroLogger)) return false;
+		if (obj == this) return true;
+		AbstractHadoopLogger toCompare = (AbstractHadoopLogger) obj;
+		
+		return new EqualsBuilder()
+					.append(this.getName(), toCompare.getName())
+					.append(this.getProduct(), toCompare.getProduct())
+					.append(this.getStage(), toCompare.getStage())
+					.isEquals();		
+	}
+	
+	@Override
+	public int hashCode(){
+		return new HashCodeBuilder()
+						.append(getName())
+						.append(getProduct())
+						.append(getStage())
+						.hashCode();		
+	}
+	
+	/**
+	 * Method to convert an Exception into a String format and to enable logging the same into the logger. 
+	 * @param t
+	 * @return
+	 */
+	protected String convertThrowableToString(Throwable thrown){
+		if (thrown == null) return "";
+		StringWriter stringWriter = new StringWriter();
+		PrintWriter printWriter = new PrintWriter(stringWriter);
+		thrown.printStackTrace(printWriter);
+		printWriter.close();
+		return stringWriter.toString();
+	}
+
+
+	@Override
+	public void setControlPoint(String aControlPoint) {
+		controlPoint = aControlPoint;
+		
+	}
+
+	@Override
+	public void setProduct(String aProduct) {
+		product = aProduct;
+		
+	}
+	
+	@Override
+	public void setStage(String aStage){
+		this.stage = aStage;
+	}
+	
+	@Override
+	public void logSummary(HADOOPLOGTYPE messageType, String tableNameorFileName){
+		if (logs.size() == 0) return;
+		StringBuilder consolidatedMessage = new StringBuilder("Summary:");
+		for (HadoopLog log : logs){
+			if (log.getMessageType().equals(messageType)){
+				//Build a concatenated String
+				consolidatedMessage.append(log.getMessage());
+				consolidatedMessage.append("|");
+			}
+		}
+		
+		if (consolidatedMessage.toString().equalsIgnoreCase("Summary:")) {
+			return;
+		}
+		else{
+			String consolidatedMessageAsString = consolidatedMessage.toString();
+			String cmRemovedLastHypen = consolidatedMessageAsString.substring(0, consolidatedMessageAsString.length() - 1);
+			log(messageType, "SUMMARY", "", tableNameorFileName, cmRemovedLastHypen);
+		}
+		
+	}
+	
+	
+	
+	public boolean isLogLineageMessage() {
+		return logLineageMessage;
+	}
+
+	public void setLogLineageMessage(boolean logLineageMessage) {
+		this.logLineageMessage = logLineageMessage;
+	}
+
+	/**
+	 * applicationId - Will map to file_or_table_name
+	 */
+	@Override
+	public void logLineageSummary(String applicationId, String subStage, String lineageMessage) {
+		if (logLineageMessage == false) return;
+		log(HADOOPLOGTYPE.LINEAGE_SUMMARY, subStage,  getName() ,applicationId , lineageMessage);
+	}
+
+	/**
+	 * applicationId - Will map to file_or_table_name
+	 */
+	@Override
+	public void logLineageDetail(String applicationId, String subStage, String lineageMessage) {
+		if (logLineageMessage == false) return;
+		log(HADOOPLOGTYPE.LINEAGE_DETAIL, subStage,  getName() ,applicationId , lineageMessage);
+	}
+
+	
+	/*public void log(HADOOPLOGTYPE messageType, String subStage, 
+			String sourceName, String tableNameorFileName, 
+			String message) */
+
+	public class HadoopLog{
+		HADOOPLOGTYPE messageType;
+		String subStage;		
+		String tableNameorFileName; 
+		String message;		
+		String application;
+		String product; 
+		String stage;
+		String sourceName;
+		String controlPoint;
+		String runId;
+		
+		public HadoopLog(String anApplication,
+				String aProduct, 
+				HADOOPLOGTYPE aMessageType, 
+				String aStage, 
+				String aSubStage,
+				String aTableNameorFileName,
+				String aSourceName,
+				String aControlPoint,
+				String aMessage,
+				String aRunid){
+			
+			messageType = aMessageType;
+			subStage = aSubStage;
+			sourceName = aSourceName;
+			tableNameorFileName = aTableNameorFileName;
+			message = aMessage;
+			application = anApplication;					
+			product = aProduct;
+			stage = aStage;
+			controlPoint = aControlPoint;
+			runId = aRunid;
+		}
+
+		public HADOOPLOGTYPE getMessageType() {
+			return messageType;
+		}
+
+		public void setMessageType(HADOOPLOGTYPE messageType) {
+			this.messageType = messageType;
+		}
+
+		public String getSubStage() {
+			return subStage;
+		}
+
+		public void setSubStage(String subStage) {
+			this.subStage = subStage;
+		}
+
+		public String getTableNameorFileName() {
+			return tableNameorFileName;
+		}
+
+		public void setTableNameorFileName(String tableNameorFileName) {
+			this.tableNameorFileName = tableNameorFileName;
+		}
+
+		public String getMessage() {
+			return message;
+		}
+
+		public void setMessage(String message) {
+			this.message = message;
+		}
+
+		public String getApplication() {
+			return application;
+		}
+
+		public void setApplication(String application) {
+			this.application = application;
+		}
+
+		public String getProduct() {
+			return product;
+		}
+
+		public void setProduct(String product) {
+			this.product = product;
+		}
+
+		public String getStage() {
+			return stage;
+		}
+
+		public void setStage(String stage) {
+			this.stage = stage;
+		}
+
+		public String getSourceName() {
+			return sourceName;
+		}
+
+		public void setSourceName(String sourceName) {
+			this.sourceName = sourceName;
+		}
+
+		public String getControlPoint() {
+			return controlPoint;
+		}
+
+		public void setControlPoint(String controlPoint) {
+			this.controlPoint = controlPoint;
+		}
+
+		public String getRunId() {
+			return runId;
+		}
+
+		public void setRunId(String runId) {
+			this.runId = runId;
+		}
+		
+		
+		
+	}
+	
+}
