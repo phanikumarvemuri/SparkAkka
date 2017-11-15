@@ -1,0 +1,93 @@
+package flowbot.processors
+
+import com.bac.rctt.apps.flowbot.envelope.{DataFrameEnvelope, FlowEnvelope}
+import org.apache.spark.SparkContext
+
+import scala.sys.process._
+
+class ExecuteCMD() extends BaseProcessor {
+  def run(sc: SparkContext, hiveContext: org.apache.spark.sql.hive.HiveContext, flowEnvelope: FlowEnvelope, step: String): FlowEnvelope = {
+    var getItemList: String = {
+      if (flowEnvelope.hasAttribute(step + ".cmdListLiteral")) {
+        flowEnvelope.getAttribute(step + ".cmdListLiteral")
+      } else if (flowEnvelope.hasAttribute(step + ".cmdListFile")) {
+        hdfsFileAsString(flowEnvelope.getAttribute(step + ".cmdListFile"), flowEnvelope)
+      } else {
+        flowEnvelope.getAttribute(step + ".command")
+      }
+    }
+
+    var subStepNumber = 1
+
+    getItemList.trim().split(";").foreach(command => {
+      logger.info("Item to execute:" + command)
+      var newstep = step + "-" + subStepNumber
+      logger.info("New Step Name:" + newstep)
+
+      flowEnvelope.cloneAttributes(step, newstep)
+      flowEnvelope.setAttribute(newstep + ".command", command)
+
+      logger.info("found filesystem step! Going to pass '" + newstep + "' to sp.getTextFile")
+      flowEnvelope.mergeAttributes(executeCommand(sc, hiveContext, flowEnvelope, newstep).getAttributes())
+      flowEnvelope.checkQuality(newstep)
+
+    })
+
+    flowEnvelope
+  }
+
+
+  def executeCommand(sc: SparkContext, hiveContext: org.apache.spark.sql.hive.HiveContext, flowEnvelope: FlowEnvelope, step: String): DataFrameEnvelope = {
+    val envelope = new DataFrameEnvelope(step)
+  val command = flowEnvelope.getAttribute(step + ".command")
+    logger.info("Excecuting system command: " + command)
+    val output: String = {
+      if (envelope.hasAttribute(step + ".pipeInto")) {
+        val pipeInto = envelope.getAttribute(step + ".pipeInto")
+        logger.info("Piping output into: " + pipeInto)
+
+        command #| pipeInto !!
+
+      } else if (envelope.hasAttribute(step + ".onSuccess") && envelope.hasAttribute(step + ".onFailure")) {
+        val onSuccess = envelope.getAttribute(step + ".onSuccess")
+        val onFailure = envelope.getAttribute(step + ".onFailure")
+        logger.info("On success executing: " + onSuccess)
+        logger.info("On failure executing: " + onFailure)
+
+        command #&& onSuccess #|| onFailure !!
+
+      } else if (envelope.hasAttribute(step + ".onSuccess")) {
+        val onSuccess = envelope.getAttribute(step + ".onSuccess")
+        logger.info("On success executing: " + onSuccess)
+
+        command #&& onSuccess !!
+      } else if (envelope.hasAttribute(step + ".onFailure")) {
+        val onFailure = envelope.getAttribute(step + ".onFailure")
+        logger.info("On failure executing: " + onFailure)
+
+        command #|| onFailure !!
+
+      } else command !!
+    }
+
+    envelope.setAttribute(step  + ".output", output)
+
+    logger.info(envelope.getAttribute(step + ".name") + " returning " + output)
+
+    envelope
+  }
+
+
+
+  override def validate(flowEnvelope: FlowEnvelope, step: String): Boolean = {
+    logger.info("Verifying " + step)
+    var confGood = super.validate(flowEnvelope: FlowEnvelope, step: String)
+
+    if (!flowEnvelope.hasAttribute(step + ".command")) {
+      logger.error(step + " is missing attribute command, which is required for action ExecuteCommand")
+      confGood = false
+    }
+
+    confGood
+  }
+}
