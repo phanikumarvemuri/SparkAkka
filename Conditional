@@ -1,0 +1,354 @@
+package flowbot.processors
+
+import java.util.concurrent.TimeUnit
+
+import com.bac.rctt.apps.flowbot.envelope.{DataFrameEnvelope, FlowEnvelope}
+import com.bac.rctt.apps.flowbot.util.{FormatUtils, Functions}
+import org.apache.spark.SparkContext
+import org.apache.spark.sql.SQLContext
+import org.apache.spark.sql.hive.HiveContext
+import scala.util.Try
+
+
+
+class Conditional() extends BaseProcessor{
+  
+   val PRINT_FROMATTER="******************"
+  def run(sc: SparkContext, hiveContext: org.apache.spark.sql.hive.HiveContext, flowEnvelope: FlowEnvelope, step: String): FlowEnvelope = {
+    
+   try{
+    var getItemList: String = {
+        if (flowEnvelope.hasAttribute(step + ".conditionalLiteral")) {
+          flowEnvelope.getAttribute(step + ".conditionalLiteral")
+        } else {
+          hdfsFileAsString(flowEnvelope.getAttribute(step + ".conditionalFile"), flowEnvelope)
+      }}
+    
+      var subStepNumber = 1
+      var passedSteps = new StringBuilder()
+      var failedSteps = new StringBuilder()
+      var falseORCounter = 0
+      var falseANDCounter = 0
+      
+      val operator = flowEnvelope.getOrDefault(step + ".operator","AND")
+  
+      getItemList.trim().split(";").foreach(getItem => {
+        logger.info("Item to execute:" + getItem)
+        var newstep = step + "-" + subStepNumber
+        logger.info("New Step Name:" + newstep)
+  
+        flowEnvelope.cloneAttributes(step, newstep)
+        
+        val literalString: Array[String] = getItem.split("\\|")
+        logger.info(PRINT_FROMATTER+"Object1 used:" + literalString(0).trim())
+        logger.info(PRINT_FROMATTER+"Object2 used :" + literalString(1).trim())
+        logger.info(PRINT_FROMATTER+"Expression used :" + literalString(2).trim())
+        
+               
+        if(literalString.length<2 || literalString.length<3){
+          logger.error("One of the mandatory parameter Object2 or Expression is missing in the conditionalLiteral/conditionalFile property in conf.")
+          throw new Exception("One of the mandatory parameter Object2 or Expression is missing in the conditionalLiteral/conditionalFile property in conf.")
+        }
+        if(literalString.length>3){
+          logger.error("Only 3 parameters are expected for one conditionalLiteral in the format as : object1|object2|expression.The literal provided in" +newstep+ " is "+getItem)
+          throw new Exception("One of the mandatory parameter Object2 or Expression is missing in the conditionalLiteral/conditionalFile property in conf.")
+        }
+        flowEnvelope.setAttribute(newstep + ".object1",  literalString(0).trim())
+        flowEnvelope.setAttribute(newstep + ".object2",  literalString(1).trim())
+        flowEnvelope.setAttribute(newstep + ".expression",  literalString(2).trim())
+        
+        flowEnvelope.getAttribute(newstep + ".expression") match {
+         case "equals" => ()
+         case "not equals" => ()
+         case "equalsIgnoreCase" => ()
+         case "In" => ()
+         case "greater than" => ()
+         case "smaller than" => ()
+         case "between" => ()
+         case _ =>
+        logger.error(step + ".expression is set to unrecognized value " + flowEnvelope.getAttribute(step + ".expression")+".Available list of expressions are: equals,not equals,equalsIgnoreCase,In,greater than,smaller than,between.")
+       }
+        
+        logger.info("found Conditional step! Going to pass '" + newstep + "' to sp.conditional")
+        flowEnvelope.mergeAttributes(conditional(sc, hiveContext, flowEnvelope, newstep).getAttributes())
+        
+        if(operator.equalsIgnoreCase("AND")){
+          if (flowEnvelope.getAttribute(newstep + ".conditionPassed") == "false") {
+            failedSteps = failedSteps.append(getItem).append(" (Values are : ").append(flowEnvelope.getAttribute(newstep + ".compared_values")).append(")").append(";")
+            falseANDCounter += 1
+          }else{
+            passedSteps = passedSteps.append(getItem).append(" (Values are :").append(flowEnvelope.getAttribute(newstep + ".compared_values")).append(")").append(";")
+          }
+        }
+        if(operator.equalsIgnoreCase("OR")){
+          if (flowEnvelope.getAttribute(newstep + ".conditionPassed") == "false") {
+            failedSteps = failedSteps.append(getItem).append(" (Values are : ").append(flowEnvelope.getAttribute(newstep + ".compared_values")).append(")").append(";")
+            falseORCounter += 1 
+          }else{
+            passedSteps = passedSteps.append(getItem).append(" (Values are :").append(flowEnvelope.getAttribute(newstep + ".compared_values")).append(")").append(";")
+
+          }
+        }
+        
+        subStepNumber += 1
+      })
+
+    flowEnvelope.setAttribute(step+ ".conditional_check_pass" ,passedSteps.toString())
+    flowEnvelope.setAttribute(step+ ".conditional_check_fail" , failedSteps.toString())
+    flowEnvelope.setAttribute(step+ ".conditional_check_status" , " Passed conditions are: "+passedSteps + " Failed conditions are : " + failedSteps )
+
+
+      if(flowEnvelope.getAttribute(step + ".failureAction").contains("fail")){
+        if((subStepNumber-1)==falseORCounter){
+          logger.error("Total "+(subStepNumber-1)+" conditions were executed and "+falseORCounter+" conditions failed")
+          logger.error(PRINT_FROMATTER+"List of failed conditions are: "+failedSteps)
+          logger.error(PRINT_FROMATTER+"List of Passed conditions are: "+passedSteps)
+
+          flowEnvelope.setAttribute(step+ ".conditional_check_pass" ,passedSteps.toString())
+          flowEnvelope.setAttribute(step+ ".conditional_check_fail" , failedSteps.toString())
+          flowEnvelope.setAttribute(step+ ".conditional_check_status" , " Passed conditions are: "+passedSteps + " Failed conditions are : " + failedSteps )
+
+         throw new Exception("Condition failed" + failedSteps)
+        }
+        if(falseANDCounter>0){
+          logger.error("Total "+(subStepNumber-1)+" conditions were executed and "+falseANDCounter+" conditions failed")
+          logger.error(PRINT_FROMATTER+"List of failed conditions are: "+failedSteps)
+          logger.error(PRINT_FROMATTER+" List of Passed conditions are: "+passedSteps)
+
+          flowEnvelope.setAttribute(step+ ".conditional_check_pass" ,passedSteps.toString())
+          flowEnvelope.setAttribute(step+ ".conditional_check_fail" , failedSteps.toString())
+          flowEnvelope.setAttribute(step+ ".conditional_check_status" , " Passed conditions are: "+passedSteps + " Failed conditions are : " + failedSteps )
+
+          throw new Exception("Condition failed " + failedSteps)
+        }
+      }
+      
+      val failurecount = falseANDCounter + falseORCounter
+      logger.info("Total "+(subStepNumber-1)+" conditions were executed and "+failurecount+" conditions failed")
+
+
+
+    logger.info(PRINT_FROMATTER + "conditional_check_pass : " +passedSteps)
+    logger.info(PRINT_FROMATTER + "conditional_check_fail : " + failedSteps)
+
+      flowEnvelope
+      
+     }catch{
+        case e: Exception => logger.error(PRINT_FROMATTER + "Error occured while running Conditional processor."+ e)
+        throw e
+     }
+     
+  }
+   
+   def conditional(sc: SparkContext, hiveContext: HiveContext, flowEnvelope: FlowEnvelope, step: String): FlowEnvelope = {
+    val action = flowEnvelope.getAttribute(step + ".failureAction")
+    val env = action match {
+      case "wait" => waitOnCondition(hiveContext, flowEnvelope, step)
+      case "fail" => failOnCondition(hiveContext, flowEnvelope, step)
+      case "continue" => failOnCondition(hiveContext, flowEnvelope, step)
+    }
+
+    flowEnvelope.mergeAttributes(env.getAttributes())
+
+    flowEnvelope
+  }
+
+  def failOnCondition(sql: SQLContext, flowEnvelope: FlowEnvelope, step: String): DataFrameEnvelope = {
+    logger.info("Running failOnCondition")
+    val envelope = new DataFrameEnvelope(step)
+    envelope.setAttribute(step + ".function-uuid", "216c5bb0-359d-11e7-a919-92ebcb67fe33")
+    envelope.mergeAttributes(flowEnvelope.getAttributes())
+
+    if(flowEnvelope.hasAttribute(step + ".sqlCondition")){
+      val condition = flowEnvelope.getAttribute(step + ".sqlCondition")
+      if (sql.sql(condition).select("result").first().getBoolean(0).equals(false)) {
+        envelope.setAttribute(step + ".conditionPassed", "false")
+      } else {
+        envelope.setAttribute(step + ".conditionPassed", "true")
+      }
+    }
+    var status: Boolean =false
+    if(flowEnvelope.hasAttribute(step + ".object1") || flowEnvelope.hasAttribute(step + ".object2")){
+       status = checkCondition(flowEnvelope, step)
+    }
+    if(status) envelope.setAttribute(step + ".conditionPassed", "true")
+    else envelope.setAttribute(step + ".conditionPassed", "false")
+    
+    envelope
+  }
+
+
+  def checkCondition(flowEnvelope: FlowEnvelope, step: String): Boolean = {
+     val expression = flowEnvelope.getAttribute(step + ".expression")
+     var status = false
+     var object1=""
+      if(flowEnvelope.getAttribute(step + ".object1").contains("flow."))  object1 = flowEnvelope.getAttribute(flowEnvelope.getAttribute(step + ".object1"))
+      else  object1 = flowEnvelope.getAttribute(step + ".object1")
+      
+      var object2 =""
+      var listValues : Array[String] = null
+      if(!(flowEnvelope.getAttribute(step + ".expression").contains("between") || flowEnvelope.getAttribute(step + ".expression").contains("In"))){
+        if(flowEnvelope.getAttribute(step + ".object2").contains("flow.")) object2 = flowEnvelope.getAttribute(flowEnvelope.getAttribute(step + ".object2"))
+        else object2 = flowEnvelope.getAttribute(step + ".object2")
+      }else{
+        listValues = flowEnvelope.getAttribute(step + ".object2").split(",")
+        
+      }
+     
+      var obj1DatatypeCheck = Try(object1.toDouble).isSuccess     //Returns true if object1 is integer/double, else returns false if object1 is string
+      var obj2DatatypeCheck :Boolean = false
+      var listDatatypeCheck :Boolean = false
+      
+      if(object2.isEmpty()){
+        listDatatypeCheck = Try(listValues(0).toDouble).isSuccess
+      }else{
+        obj2DatatypeCheck = Try(object2.toDouble).isSuccess
+      }
+     
+      if(object2.isEmpty()){
+        if(((!obj1DatatypeCheck) && (listDatatypeCheck))||((obj1DatatypeCheck) && (!listDatatypeCheck)))
+        logger.error(step + " has attribute object1 and object2 both of different datatypes. For one condition both of the attribute should have same datatype either String or Integer/Double.")
+  
+      }else if(((!obj1DatatypeCheck) && (obj2DatatypeCheck))||((obj1DatatypeCheck) && (!obj2DatatypeCheck))){
+        logger.error(step + " has attribute object1 and object2 both of different datatypes. For one condition both of the attribute should have same datatype either String or Integer/Double.")
+      }
+      
+      if((!obj1DatatypeCheck) && (!obj2DatatypeCheck)){               //If object1 and object2 are String
+        
+         expression match {
+         case "equals" => ()
+         case "not equals" => ()
+         case "equalsIgnoreCase" => ()
+         case "In" => ()
+         case _ =>
+          logger.error(step + ".expression is set to unrecognized value " + expression+".Available list of expressions for String comparisons are: equals,not equals,equalsIgnoreCase,In.")
+         }
+         
+        status = expression match {
+          case "equals" =>  object1.equals(object2)
+          case "not equals" => !(object1.equals(object2))
+          case "equalsIgnoreCase" => object1.equalsIgnoreCase(object2)
+          case "In" => listValues.toList.contains(object1)
+      }
+
+        flowEnvelope.setAttribute(step + ".compared_values" ,object1+" "+ expression + " "+object2)
+     }
+      
+     if((obj1DatatypeCheck && obj2DatatypeCheck)||(obj1DatatypeCheck && listDatatypeCheck) ){                  //If object1 and object2 are Integer/Double
+       val intOject1 = object1.toDouble
+       var intObject2 =0.00
+       var intList :Array[Double] =null
+       
+       if(!object2.isEmpty())    intObject2 = object2.toDouble
+       else intList = listValues.map(_.toDouble)
+       
+       expression match {
+       case "equals" => ()
+       case "not equals" => ()
+       case "greater than" => ()
+       case "In" => ()
+       case "smaller than" => ()
+       case "between" =>
+       case _ =>
+        logger.error(step + ".expression is set to unrecognized value " + expression+".Available list of expressions for Integer/Double comparisons are: equals,not equals,between,greater than,smaller than,In.")
+       }
+     
+       
+       status = expression match {
+        case "equals" =>  intOject1==intObject2
+        case "greater than" => intOject1 > intObject2
+        case "smaller than" => intOject1 < intObject2
+        case "not equals" => intOject1 != intObject2
+        case "between" => intOject1>=listValues(0).toDouble && intOject1<=listValues(1).toDouble
+        case "In" => intList.toList.contains(intOject1)
+      }
+
+       flowEnvelope.setAttribute(step + ".compared_values",String.valueOf(intOject1)+" "+ expression + " "+ String.valueOf(intObject2))
+     }
+    
+     status
+  }
+  
+  def waitOnCondition(hiveContext: org.apache.spark.sql.hive.HiveContext, flowEnvelope: FlowEnvelope, step: String): DataFrameEnvelope = {
+    logger.info("Running waitOnCondition")
+    val envelope = new DataFrameEnvelope(step)
+    envelope.setAttribute(step + ".function-uuid", "216c5bb0-359d-11e7-a919-92ebcb67fe33")
+    envelope.mergeAttributes(flowEnvelope.getAttributes())
+
+    val condition = flowEnvelope.getAttribute(step + ".sqlCondition")
+    val waitInterval = FormatUtils.getTimeDuration(flowEnvelope.getAttribute(step + ".waitInterval"), TimeUnit.MILLISECONDS)
+    val waitTimeout = FormatUtils.getTimeDuration(flowEnvelope.getAttribute(step + ".waitTimeout"), TimeUnit.MILLISECONDS)
+
+    val startTime = Functions.getCurrentMillis().toLong
+    var currTime = Functions.getCurrentMillis().toLong
+
+    while (hiveContext.sql(condition).select("result").first().getBoolean(0).equals(false) && envelope.hasAttribute(step + ".waitTimeOutExceeded.failure").equals(false)) {
+      logger.info("Waiting...")
+      if ((currTime - startTime) > waitTimeout) {
+        envelope.setAttribute(step + ".conditionPassed", "false")
+      } else {
+        envelope.setAttribute(step + ".conditionPassed", "true")
+        Thread.sleep(waitInterval)
+        currTime = Functions.getCurrentMillis().toLong
+      }
+    }
+
+    val endTime = Functions.getCurrentMillis().toLong
+
+    flowEnvelope.setAttribute(step + ".waitStart", (startTime / 1000).toString)
+    flowEnvelope.setAttribute(step + ".waitEnd", (endTime / 1000).toString)
+
+    envelope
+  }
+
+
+  
+  
+  
+  override def validate(flowEnvelope: FlowEnvelope, step: String): Boolean = {
+    logger.info("Verifying " + step)
+    var confGood = super.validate(flowEnvelope: FlowEnvelope, step: String)
+    
+     if (!flowEnvelope.hasAttribute(step + ".failureAction")) {
+        logger.error(step + " is missing attribute failureAction which is required for action Conditional.")
+        confGood = false
+      }
+
+    if(flowEnvelope.hasAttribute(step + ".failureAction")){
+      flowEnvelope.getAttribute(step + ".failureAction") match {
+        case "fail" => ()
+        case "wait" =>
+          for (attribute <- Set("waitInterval", "waitTimeout")) {
+            if (!flowEnvelope.hasAttribute(step + "." + attribute)) {
+              logger.error(step + " is missing attribute " + attribute + " which is required for action Conditional if failureAction is wait")
+              confGood = false
+            }
+          }
+        case "continue" => ()
+        case _ =>
+          logger.error(step + ".failureAction is set to unrecognized value " + flowEnvelope.getAttribute(step + ".failureAction"))
+          confGood = false
+      }
+    }
+    if(!flowEnvelope.hasAttribute(step + ".sqlCondition")){
+       if (!flowEnvelope.hasAttribute(step + ".conditionalLiteral") && !flowEnvelope.hasAttribute(step + ".conditionalFile")) {
+        logger.error(step + " is missing both conditionalLiteral and conditionalFile. One of the two must be defined for action Conditional.")
+        confGood = false
+      }
+      if (flowEnvelope.hasAttribute(step + ".conditionalLiteral") && flowEnvelope.hasAttribute(step + ".conditionalFile")) {
+        logger.error(step + " has attribute conditionalLiteral and conditionalFile. Only one can be defined for action Conditional.")
+        confGood = false
+      }
+
+    }
+    if(flowEnvelope.hasAttribute(step + ".sqlCondition") && (flowEnvelope.hasAttribute(step + ".conditionalLiteral")||flowEnvelope.hasAttribute(step + ".conditionalFile"))){
+      logger.error(step + " has attribute sqlCondition and conditionalLiteral/conditionalFile. Only one can be defined for action Conditional.")
+       confGood = false
+    }
+    if(!flowEnvelope.hasAttribute(step + ".sqlCondition") && !(flowEnvelope.hasAttribute(step + ".conditionalLiteral")||flowEnvelope.hasAttribute(step + ".conditionalFile"))){
+      logger.error(step + " is missing both sqlCondition and conditionalLiteral/conditionalFile. Only of the two must be defined for action Conditional.")
+       confGood = false
+    }
+   confGood
+  }
+}
