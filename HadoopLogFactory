@@ -1,0 +1,437 @@
+
+package logging;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.Map;
+import java.util.Properties;
+import java.util.concurrent.ConcurrentHashMap;
+
+import org.apache.commons.lang3.StringUtils;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.log4j.Logger;
+
+import logging.HadoopLogger.DDI_LAYER;
+
+
+public class HadoopLogFactory {
+	
+	private static final Logger log4jLogger = Logger.getLogger(HadoopLogFactory.class);
+
+	private static final String HADOOP_LOG_PROPS_SCHEMA = "schemaPath";
+	private static final String HADOOP_LOG_PROPS_LOCATION = "logLocation";
+	private static final String HADOOP_LOG_PROPS_CANLOGMESSAGE = "canLogMessage";
+	private static final String HADOOP_LOG_PROPS_CAN_LOGLINEAGE_MESSAGE = "canLogLineageMessage";
+	private static final String HADOOP_LOG_PROPS_APPLICATION = "application";
+	private static final String HADOOP_LOG_PROPS_LOGLEVEL = "logLevel";
+	private static final String HADOOP_LOG_PROPS_PRODUCT = "product";	
+	private static final String HADOOP_LOG_PROPERTIES = "hadooplog4j.properties";
+
+	private static String schemaPath;
+	private static String baseLogPath;
+	private static Boolean loggingEnabled = true;
+	private static Boolean lineageLoggingEnabled = true;
+	private static String application;
+	private static String logLevel;
+	private static String appLevelProduct;
+	private static Properties alpideLogProperties;
+
+	/**
+	 * Internal Mapper for the Logger that will maintain the Component name and its corresponding Logger.
+	 */
+	private static Map <String, HDFSAvroLogger> loggerMap = new  ConcurrentHashMap<String, HDFSAvroLogger>();
+
+	static{
+		Runtime.getRuntime().addShutdownHook(new LoggerReseter());
+	}
+
+	/**
+	 * Get Instance method will be provide the callers with an Implementation of AlpideLogger.
+	 * Steps it does before providing the logger
+	 * 	1) Will load the properties file (alpide_log.properties) from the class path
+	 *  2) If the properties file is not available it could potentially mean a) The caller is a mapper/reducer b) properties file was not available
+	 *  	For scenario a) the properties will be loaded from Configuration object
+	 *  				 b) The DummyHadoopLogger will be provided back so that the MapReduce or the client trying to Log program will not stop due to logging issues.
+	 *
+	 * @param sourceName : the class file from which logger is called.
+	 * @param product : portfolio
+	 * @param stage : ddiLayer stage
+	 * @param conf
+	 * @return
+	 *//*
+	public static HadoopLogger getInstance(String sourceName, PRODUCT_TYPE product, DDI_LAYER stage, Configuration conf){
+
+		return getHadoopLoggerInstance(sourceName,product.getCode(),stage.getCode(),"",conf);
+	}*/
+	
+	/**
+	 * Get Instance method will be provide the callers with an Implementation of AlpideLogger.
+	 * Steps it does before providing the logger
+	 * 	1) Will load the properties file (alpide_log.properties) from the class path
+	 *  2) If the properties file is not available it could potentially mean a) The caller is a mapper/reducer b) properties file was not available
+	 *  	For scenario a) the properties will be loaded from Configuration object
+	 *  				 b) The DummyHadoopLogger will be provided back so that the MapReduce or the client trying to Log program will not stop due to logging issues.
+	 *
+	 * @param sourceName : the class file from which logger is called.
+	 * @param product : portfolio
+	 * @param stage : ddiLayer stage
+	 * @param conf
+	 * @return
+	 *//*
+	public static HadoopLogger getInstance(String sourceName, PRODUCT_TYPE product, DDI_LAYER stage, String controlPoint, Configuration conf){
+
+		return getHadoopLoggerInstance(sourceName,product.getCode(),stage.getCode(),controlPoint,conf);
+	}
+*/	
+	/**
+	 * Get Instance method will be provide the callers with an Implementation of AlpideLogger.
+	 * Steps it does before providing the logger
+	 * 	1) Will load the properties file (alpide_log.properties) from the class path
+	 *  2) If the properties file is not available it could potentially mean a) The caller is a mapper/reducer b) properties file was not available
+	 *  	For scenario a) the properties will be loaded from Configuration object
+	 *  				 b) The DummyHadoopLogger will be provided back so that the MapReduce or the client trying to Log program will not stop due to logging issues.
+	 *
+	 * @param sourceName : the class file from which logger is called.
+	 * @param product : portfolio
+	 * @param stage : ddiLayer stage
+	 * @return
+	 */
+	public static HadoopLogger getInstance(String sourceName, String product, String stage, Configuration conf) {
+		
+		return getHadoopLoggerInstance(sourceName, product, stage,"", null ,conf);
+	}
+	
+	/**
+	 * Get Instance method will be provide the callers with an Implementation of AlpideLogger.
+	 * Steps it does before providing the logger
+	 * 	1) Will load the properties file (alpide_log.properties) from the class path
+	 *  2) If the properties file is not available it could potentially mean a) The caller is a mapper/reducer b) properties file was not available
+	 *  	For scenario a) the properties will be loaded from Configuration object
+	 *  				 b) The DummyHadoopLogger will be provided back so that the MapReduce or the client trying to Log program will not stop due to logging issues.
+	 *
+	 * @param sourceName : the class file from which logger is called.
+	 * @param product : portfolio
+	 * @param stage : ddiLayer stage
+	 * @return
+	 */
+	public static HadoopLogger getInstance(String sourceName, String product, DDI_LAYER stage, Configuration conf) {
+			
+			return getHadoopLoggerInstance(sourceName, product, stage.getCode(),"", null, conf);
+	}
+	
+	/**
+	 * Get Instance method will be provide the callers with an Implementation of AlpideLogger.
+	 * Steps it does before providing the logger
+	 * 	1) Will load the properties file (alpide_log.properties) from the class path
+	 *  2) If the properties file is not available it could potentially mean a) The caller is a mapper/reducer b) properties file was not available
+	 *  	For scenario a) the properties will be loaded from Configuration object
+	 *  				 b) The DummyHadoopLogger will be provided back so that the MapReduce or the client trying to Log program will not stop due to logging issues.
+	 *
+	 * @param sourceName : the class file from which logger is called.
+	 * @param stage : ddiLayer stage
+	 * @return
+	 */
+	public static HadoopLogger getInstance(String sourceName, DDI_LAYER stage,  Configuration conf) {
+		
+		return getHadoopLoggerInstance(sourceName, "", stage.getCode(), "" , null ,conf);
+	}
+	
+	
+	/**
+	 * Get Instance method will be provide the callers with an Implementation of AlpideLogger.
+	 * Steps it does before providing the logger
+	 * 	1) Will load the properties file (alpide_log.properties) from the class path
+	 *  2) If the properties file is not available it could potentially mean a) The caller is a mapper/reducer b) properties file was not available
+	 *  	For scenario a) the properties will be loaded from Configuration object
+	 *  				 b) The DummyHadoopLogger will be provided back so that the MapReduce or the client trying to Log program will not stop due to logging issues.
+	 *
+	 * @param sourceName : the class file from which logger is called.
+	 * @param stage : ddiLayer stage
+	 * @return
+	 */
+	public static HadoopLogger getInstance(String sourceName, DDI_LAYER stage, String runId, Configuration conf) {
+		
+		return getHadoopLoggerInstance(sourceName, "", stage.getCode(), "" , runId ,conf);
+	}
+	
+	/**
+	 * Get Instance method will be provide the callers with an Implementation of AlpideLogger.
+	 * Steps it does before providing the logger
+	 * 	1) Will load the properties file (alpide_log.properties) from the class path
+	 *  2) If the properties file is not available it could potentially mean a) The caller is a mapper/reducer b) properties file was not available
+	 *  	For scenario a) the properties will be loaded from Configuration object
+	 *  				 b) The DummyHadoopLogger will be provided back so that the MapReduce or the client trying to Log program will not stop due to logging issues.
+	 *
+	 * @param sourceName : the class file from which logger is called.
+	 * @param product : product name
+	 * @param stage : ddiLayer stage
+	 * @param controlPoint : control point name
+	 * @param conf : Configuration object
+	 * @return
+	 */
+	public static HadoopLogger getInstance(String sourceName, String product, DDI_LAYER stage, String controlPoint, Configuration conf) {
+		
+		return getHadoopLoggerInstance(sourceName, product, stage.getCode(), controlPoint , null ,conf);
+	}
+	
+	/**
+	 * Get Instance method will be provide the callers with an Implementation of AlpideLogger.
+	 * Steps it does before providing the logger
+	 * 	1) Will load the properties file (alpide_log.properties) from the class path
+	 *  2) If the properties file is not available it could potentially mean a) The caller is a mapper/reducer b) properties file was not available
+	 *  	For scenario a) the properties will be loaded from Configuration object
+	 *  				 b) The DummyHadoopLogger will be provided back so that the MapReduce or the client trying to Log program will not stop due to logging issues.
+	 *
+	 * @param sourceName : the class file from which logger is called.
+	 * @param product : product name
+	 * @param stage : ddiLayer stage
+	 * @param controlPoint : control point name
+	 * @param conf : Configuration object
+	 * @return
+	 */
+	public static HadoopLogger getInstance(String sourceName, String product, DDI_LAYER stage, String controlPoint, String runId, Configuration conf) {
+		
+		return getHadoopLoggerInstance(sourceName, product, stage.getCode(), controlPoint , runId , conf);
+	}	
+	
+	private static HadoopLogger getHadoopLoggerInstance(String sourceName, String product, String stage, String controlPoint, String runId, Configuration conf) {	
+		
+		if (loggerMap.get(sourceName) != null) {
+			return loggerMap.get(sourceName);
+		}
+		
+		if (conf == null){			
+			conf = new Configuration();		
+		}
+		
+		//Get the properties file name from the configuration itself. 
+		//This should be available in the Configuration object
+		String propertiesFileName = HADOOP_LOG_PROPERTIES;
+		
+		// log4jLogger.info(alpideLogProperties);
+		//TODO: Refactor to a better implementation
+		if (alpideLogProperties == null){		
+			alpideLogProperties = loadProperties(propertiesFileName);
+
+			if (alpideLogProperties == null || alpideLogProperties.isEmpty()){
+				throw new IllegalStateException("hadooplog4j.properties file is not available in the classpath. Please provide the properties file to continue further.");
+				//log4jLogger.error(HADOOP_LOG_PROPERTIES + " is not available in the classpath. Hadoop Logging will fail.");
+				//log4jLogger.info("returning DummyAlpideLogger...");
+				//return new DummyHadoopLogger();
+			}
+			setSchemaPath(alpideLogProperties, conf);
+			setLogLocation(alpideLogProperties, conf);
+			setUseDummyLogger(alpideLogProperties, conf);
+			setApplication(alpideLogProperties, conf);
+			setLogLevel(alpideLogProperties, conf);
+			setAppLevelProduct(alpideLogProperties,conf);
+			setLineageLogLevel(alpideLogProperties,conf);			
+		}
+		
+		if( ! loggingEnabled){
+			log4jLogger.info("Logging is disabled to returning DummyHadoopLogger");
+			return new DummyHadoopLogger();
+		}
+		//IF Schema path/location/name/stage/conf is not available/null then we can not proceed with this logging.
+		//At that case provide a dummy logger so that the log messages will not fail.
+		// log4jLogger.info("SchemaPath:" + schemaPath + ": parentLogPath" +
+		// baseLogPath);
+		if (!validateLoggerInstanceInputs(application, sourceName, product, stage, conf, schemaPath, baseLogPath)){
+			log4jLogger.info("returning DummyAlpideLogger...");
+			return new DummyHadoopLogger();
+		}
+
+		/*
+		 * Lazy Instantiation: If there Logger was not created already then the logger object needs to be created.
+		 */
+		synchronized (loggerMap) {
+			try{
+				// log4jLogger.info("HDFS Logger Conf Obtained in Constructoir: "
+				// + conf);
+				
+				if (appLevelProduct != null && (product == null || (product !=null && product.trim().equalsIgnoreCase("")))) {
+					product = appLevelProduct;
+				}
+				HDFSAvroLogger logger = null;
+				if(null == runId){
+					logger= new HDFSAvroLogger(baseLogPath, application, 
+														sourceName, product, 
+														stage, schemaPath, 
+														logLevel, controlPoint,
+														lineageLoggingEnabled ,
+														conf);
+				}
+				else{
+					
+					logger= new HDFSAvroLogger(baseLogPath, application, 
+							sourceName, product, 
+							stage, schemaPath, 
+							logLevel, controlPoint,
+							lineageLoggingEnabled , runId,
+							conf);
+				}
+				loggerMap.put(sourceName, logger);
+
+			}catch(IOException e){
+				e.printStackTrace();
+			}
+		}
+		return loggerMap.get(sourceName);
+	}
+
+	/**
+	 * To load the properties file from the classpath. This properties file will provide the basics props that this logger needs to work with.
+	 * 
+	 *
+	 */
+
+	private static Properties loadProperties(String propertiesFile){
+		InputStream logIs = Thread.currentThread().getContextClassLoader().getResourceAsStream(propertiesFile);
+		Properties alpideLogProperties = new Properties();
+		try{
+			if (logIs != null) {
+				alpideLogProperties.load(logIs);
+			}
+		}catch(Exception e){
+			//// THis could be a mapper or reducer phase.. cant expect to find the properties here...So path needs to be loaded from configuration
+			e.printStackTrace();
+		}
+		return alpideLogProperties;
+	}
+
+	/**
+	 * Set the schema path either from the Properties file or Configuration Object. Config will be given the First Priority
+	 * For User to Override if needed.
+	 * @param properties
+	 * @param conf
+	 */
+	private static void setSchemaPath(Properties properties, Configuration conf){		
+		schemaPath  = getPropertyValueAndAddToConf(properties,conf,HADOOP_LOG_PROPS_SCHEMA);
+	}
+
+	/**
+	 * Set the Log Level either from the Properties file or Configuration Object. Config will be given the First Priority
+	 * For User to Override if needed.
+	 * @param properties
+	 * @param conf
+	 */
+	private static void setLogLevel(Properties properties, Configuration conf){
+		logLevel  = getPropertyValueAndAddToConf(properties,conf,HADOOP_LOG_PROPS_LOGLEVEL);
+	}
+
+
+	/**
+	 * Set the Application Name either from the Properties file or Configuration Object. Config will be given the First Priority
+	 * For User to Override if needed.
+	 * @param properties
+	 * @param conf
+	 */
+	private static void setApplication(Properties properties, Configuration conf){
+		application  = getPropertyValueAndAddToConf(properties,conf,HADOOP_LOG_PROPS_APPLICATION);
+	}
+	/**
+	 * Set the Log path either from the Properties file or Configuration Object. Config will be given the First Priority
+	 * For User to Override if needed.
+	 * @param properties
+	 * @param conf
+	 */
+	private static void setLogLocation(Properties properties,Configuration conf){
+		baseLogPath = getPropertyValueAndAddToConf(properties,conf,HADOOP_LOG_PROPS_LOCATION);
+	}
+	
+	/**
+	 * Set the Product either from the Properties file or Configuration Object. Config will be given the First Priority
+	 * For User to Override if needed.
+	 * @param properties
+	 * @param conf
+	 */
+	private static void setAppLevelProduct(Properties properties,Configuration conf){
+		appLevelProduct = getPropertyValueAndAddToConf(properties,conf,HADOOP_LOG_PROPS_PRODUCT);
+	}
+
+	/**
+	 * Set the Log path either from the Properties file or Configuration Object. Config will be given the First Priority
+	 * For User to Override if needed.
+	 * @param properties
+	 * @param conf
+	 */
+	private static void setUseDummyLogger(Properties properties,Configuration conf){
+		String anUseDummyLogger = getPropertyValueAndAddToConf(properties,conf,HADOOP_LOG_PROPS_CANLOGMESSAGE);
+		loggingEnabled = anUseDummyLogger == null ? loggingEnabled: Boolean.valueOf(anUseDummyLogger);
+	}
+
+	/**
+	 * Set the Lineage Log Level so as to identify if Lineage Logs needs to be logged.
+	 * For User to Override if needed.
+	 * @param properties
+	 * @param conf
+	 */
+	private static void setLineageLogLevel(Properties properties,Configuration conf){
+		String canLogLineageMessage = properties.getProperty(HADOOP_LOG_PROPS_CAN_LOGLINEAGE_MESSAGE);
+		if (StringUtils.isBlank(canLogLineageMessage)){
+			canLogLineageMessage = "false";
+			properties.setProperty(HADOOP_LOG_PROPS_CAN_LOGLINEAGE_MESSAGE, canLogLineageMessage);
+		}
+		canLogLineageMessage = getPropertyValueAndAddToConf(properties,conf,HADOOP_LOG_PROPS_CAN_LOGLINEAGE_MESSAGE);
+		lineageLoggingEnabled = canLogLineageMessage == null ? lineageLoggingEnabled: Boolean.valueOf(canLogLineageMessage);
+	}
+
+	/**
+	 * Utility Method to provide the value set in the properties file
+	 * For User to Override if needed.
+	 * @param properties
+	 * @param conf
+	 */
+	private static String getPropertyValueAndAddToConf(Properties properties,Configuration conf, String propertyName){
+		String propertyValue = conf.get(propertyName);
+		if (propertyValue == null){
+			if (properties == null) {
+				return null;
+			}
+			propertyValue = properties.getProperty(propertyName);
+			if (!propertyName.equalsIgnoreCase(HADOOP_LOG_PROPS_PRODUCT)){
+				conf.set(propertyName, propertyValue);
+			}
+		}
+		return propertyValue;
+	}
+
+	/**
+	 * To check for any essential input is null.
+	 * @param inputs
+	 * @return
+	 */
+
+	private static boolean validateLoggerInstanceInputs(Object...inputs ){
+		for (Object input: inputs){
+			//log4jLogger.info(input);
+			if (input == null) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	/**
+	 * Private class to periodically reset the Logger.
+	 * @author ZK8M1AO
+	 *
+	 */
+	private static class LoggerReseter extends Thread {
+
+		@Override
+		public void run(){
+			log4jLogger.info("Hadoop Logger Shut Down Hook invoked...");
+			for (HadoopLogger logger : loggerMap.values()){
+				try{
+					logger.close();
+				}catch(Exception e){
+					e.printStackTrace();
+				}
+			}
+		}
+
+	}
+
+
+}
