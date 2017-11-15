@@ -1,0 +1,19 @@
+package flowbot.flows
+
+import org.apache.spark.SparkContext._
+import com.typesafe.config._
+import java.io._
+import com.bac.rctt.apps.flowbot.envelope.FlowEnvelope
+
+
+abstract class Flow() {
+
+   def getFlowUUID(): String = {
+    return  "db64f53e-3574-4eea-a280-ec505f20558b"
+  }
+  
+  def getFlowExecutionUUID(): String = {
+    return java.util.UUID.randomUUID().toString()
+  }
+
+}
