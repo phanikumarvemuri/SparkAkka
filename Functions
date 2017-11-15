@@ -1,0 +1,15 @@
+package com.bac.rctt.apps.flowbot.util
+
+import java.util.Calendar
+
+object Functions {
+
+  def getCurrentMillis(): String = {
+    return Calendar.getInstance.getTimeInMillis.toString()
+  }
+
+  def getUUID(): String = {
+    java.util.UUID.randomUUID().toString()
+  }
+
+}
