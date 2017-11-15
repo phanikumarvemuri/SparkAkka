@@ -1,0 +1,132 @@
+package flowbot.controller
+
+import java.text.SimpleDateFormat
+
+import com.bac.rctt.apps.flowbot.envelope.FlowEnvelope
+import com.bac.rctt.apps.flowbot.util.Functions
+import org.apache.log4j.Logger
+import org.apache.spark.sql.Row
+import org.apache.spark.sql.hive.HiveContext
+import org.apache.spark.sql.types.{StringType, StructField, StructType}
+import org.apache.spark.{SparkConf, SparkContext}
+import java.util.Date
+
+class SparkFlowController(flowEnvelope: FlowEnvelope) {
+  val logger = Logger.getLogger(getClass().getName());
+  val PRINT_FROMATTER="******************"
+  var sc: SparkContext = null
+  var hiveContext: HiveContext = null
+  
+  def run(): FlowEnvelope = {
+    val clazz: String = flowEnvelope.getAttribute("flow.class")
+    val flowName: String = flowEnvelope.getAttribute("flow.name")
+    val master: String = flowEnvelope.getAttribute("flow.engine.master")
+
+    logger.info("Starting SparkFlowController for Flow:" + flowName)
+
+    val start_time = new Date()
+    logger.info(PRINT_FROMATTER + "Flow start time : " + start_time.toString)
+    flowEnvelope.setAttribute("flow.ts_flow_start", start_time.toString)
+
+    val sparkConf: SparkConf = new SparkConf()
+      .setMaster(master)
+      .setAppName(flowName)
+
+    logger.info("SparkConf=master:" + master + ",appName=" + flowName)
+    
+    if(sc == null) {
+      sc = new SparkContext(sparkConf)
+    }
+    
+    if(hiveContext == null) {
+      hiveContext = new org.apache.spark.sql.hive.HiveContext(sc)
+    }
+
+    if (flowEnvelope.getAttribute("flow.metadata.enabled").toBoolean) {
+      loadMetadata(hiveContext)
+    }
+
+    logger.info("Instanciating Flow Class:" + clazz)
+    val flow = Class.forName(clazz).newInstance.asInstanceOf[{ def run(sc: SparkContext, hiveContext: org.apache.spark.sql.hive.HiveContext, flowEnvelope: FlowEnvelope) }]
+    logger.info("Running Flow:" + flowName)
+
+    try {
+      flowEnvelope.setAttribute("flow.app_id",sc.applicationId)
+      flow.run(sc, hiveContext, flowEnvelope)
+      flowEnvelope.setAttribute("flow.status", "success")
+
+    } catch {
+      case e: Exception =>
+        flowEnvelope.setAttribute("flow.status", "failure")
+        flowEnvelope.setAttribute("flow.status.message", e.getMessage + "\n" + e.getStackTraceString)
+        logger.error("flow.status.message:" + e.getMessage + "\n" + e.getStackTraceString)
+        throw e
+    } finally {
+      logger.info("Run Complete for Flow:" + flowName)
+      flowEnvelope.setAttribute("flow.ts_flow_end", Functions.getCurrentMillis())
+      logger.debug(flowEnvelope.toString())
+
+
+      val end_time =  new Date()
+      flowEnvelope.setAttribute("flow.ts_flow_end", end_time.toString)
+      logger.info(PRINT_FROMATTER + "Flow end time : " + end_time.toString)
+
+      val total_process_time = new SimpleDateFormat("mm:ss:SSS").format(new Date(end_time.getTime.toLong - start_time.getTime.toLong))
+      logger.info("******************Total flow process time is (in minutes:second:millisecond) :"+  total_process_time+ "******************")
+      flowEnvelope.setAttribute("flow.total_process_time",  total_process_time.toString)
+
+      if (flowEnvelope.getAttribute("flow.metadata.enabled").toBoolean == true) {
+        saveMetadata(sc, hiveContext)
+      }
+    }
+    sc.stop()
+    flowEnvelope
+  }
+
+  def loadMetadata(hiveContext: HiveContext): Unit = {
+    logger.info("Running getFlowMetadata")
+    try {
+      val metadata = hiveContext.read.load(flowEnvelope.getAttribute("flow.metadata.inLocation") + "/*/")
+      import org.apache.spark.sql.functions.max
+      import org.apache.spark.sql.types.LongType
+
+      var maxTS = Option(metadata.select(metadata("flow_attribute_key"), metadata("flow_ts_flow_end").cast(LongType).as("flow_ts_flow_end")).agg(max("flow_ts_flow_end"))
+                                 .first().get(0)).getOrElse(0L).asInstanceOf[Long]
+      
+      var lastRun = metadata.filter(metadata("flow_ts_flow_end").cast(LongType) === maxTS)
+
+      lastRun.collect.foreach({ row =>
+        logger.debug("loading metadata attribute key=" + "lastrun.metadata." + row(5).toString() + " value=" + row(6).toString())
+        flowEnvelope.setAttribute("lastrun.metadata." + row(5).toString(), row(6).toString())
+      })
+
+    } catch {
+      case e: AssertionError => logger.info("metadata is enabled but metadata not found in flow.metadata.inLocation")
+    }
+  }
+
+  def saveMetadata(sc: SparkContext, hiveContext: HiveContext): Unit = {
+    logger.info("Metadata is enabled.  Proceeding to save metadata for this flow.")
+    //flow.uuid, flow.envelope.uuid, flow.name, flow.ts_flow_start, flow.ts_flow_end, key, value
+    val f = sc.makeRDD(flowEnvelope.getAttributes.filter(lastrun => lastrun._1.startsWith("flow.")).map(e => Row(flowEnvelope.getAttribute("flow.uuid"), flowEnvelope.getAttribute("flow.envelope.uuid"), flowEnvelope.getAttribute("flow.name"), flowEnvelope.getAttribute("flow.ts_flow_start"), flowEnvelope.getAttribute("flow.ts_flow_end"), e._1, e._2,flowEnvelope.getAttribute("flow.app_id"))).toSeq)
+    val schema = StructType(
+      StructField("flow_uuid", StringType) ::
+        StructField("flow_envelope_uuid", StringType) ::
+        StructField("flow_name", StringType) ::
+        StructField("flow_ts_flow_start", StringType) ::
+        StructField("flow_ts_flow_end", StringType) ::
+        StructField("flow_attribute_key", StringType) ::
+        StructField("flow_attribute_value", StringType) ::
+        StructField("flow_app_id", StringType) ::
+        Nil)
+
+    if (flowEnvelope.getAttribute("flow.status") == "failure") {
+      logger.info("A failure was detected in this flow.  Proceeding to save metadata to failureLocation for this flow.")
+      hiveContext.createDataFrame(f, schema).repartition(1).write.format(flowEnvelope.getAttribute("flow.metadata.format")).mode(flowEnvelope.getAttribute("flow.metadata.saveMode")).save(flowEnvelope.getAttribute("flow.metadata.failureLocation"))
+
+    } else {
+      logger.info("This flow has succeeded.  Proceeding to save metadata to outLocation for this flow.")
+      hiveContext.createDataFrame(f, schema).repartition(1).write.format(flowEnvelope.getAttribute("flow.metadata.format")).mode(flowEnvelope.getAttribute("flow.metadata.saveMode")).save(flowEnvelope.getAttribute("flow.metadata.outLocation"))
+    }
+  }
+}
