@@ -1,0 +1,19 @@
+package com.bac.rctt.apps.flowbot.util
+
+import com.bac.rctt.apps.flowbot.envelope._
+
+case class SuccessInfo(flowEnvelope: FlowEnvelope, step: String, returncode: Int) {
+
+}
+
+SuccessInfoForWrite
+
+package com.bac.rctt.apps.flowbot.util
+
+import com.bac.rctt.apps.flowbot.envelope._
+
+case class SuccessInfoForWrite(flowEnvelope: FlowEnvelope, step: String, returncode: Int) {
+
+}
+
+
