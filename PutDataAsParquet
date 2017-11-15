@@ -1,0 +1,163 @@
+package flowbot.processors
+
+import java.util.ArrayList
+
+import com.bac.rctt.apps.flowbot.envelope.{DataFrameEnvelope, FlowEnvelope}
+import org.apache.spark.SparkContext
+
+import scala.collection.mutable.HashMap
+
+/**
+* Date      		Developer                  	Change
+* ========= 		========================== 	===============================================================
+* 18-Aug-17    	Ramamurthy Pavan. N         Removed/Comment out policy file dependency
+* 22-Sep-17     Ankita Jain                 Enhanced processor to enable different partitions for each element in loop
+*
+*/
+class PutDataAsParquet() extends BaseProcessor {
+  val PRINT_FROMATTER = "******************"
+
+  def run(sc: SparkContext, hiveContext: org.apache.spark.sql.hive.HiveContext, flowEnvelope: FlowEnvelope, step: String): FlowEnvelope = {
+    logger.info("found output step! Going to pass '" + step + "' to sp.putTempTableAsParquet")
+    var saveList: String = {
+      if (flowEnvelope.hasAttribute(step + ".saveListLiteral")) {
+        flowEnvelope.getAttribute(step + ".saveListLiteral")
+      } else {
+        hdfsFileAsString(flowEnvelope.getAttribute(step + ".saveListFile"), flowEnvelope)
+      }
+    }
+
+    var subStepNumber = 1
+
+    saveList.trim().split(";").foreach(saveItem => {
+      logger.info("Data to save:" + saveItem)
+      var newstep = step + "-" + subStepNumber
+      logger.info("New Step Name:" + newstep)
+      if (saveItem.lastIndexOf(" ") == -1) {
+        logger.error("Save item does not contain the save path (" + saveItem + ")")
+        throw new Exception("Save item does not contain the save path (" + saveItem + ")")
+      }
+      var saveItemName = saveItem.substring(0, saveItem.lastIndexOf(" "))
+      var saveItemPath = saveItem.substring(saveItem.lastIndexOf(" ") + 1, saveItem.length())
+
+      flowEnvelope.cloneAttributes(step, newstep)
+
+      flowEnvelope.setAttribute(newstep + ".name", saveItemName)
+      flowEnvelope.setAttribute(newstep + ".location", saveItemPath)
+
+      if(flowEnvelope.hasAttribute(step + ".partition"))
+         flowEnvelope.setAttribute(newstep + ".partition", setPartition(flowEnvelope.getAttribute(step + ".partition") ,saveItemName ))
+
+      logger.info("found putDataAsParquet step! Going to pass '" + newstep + "' to sp.putTempTableAsParquet")
+
+      flowEnvelope.mergeAttributes(putTempTableAsParquet(hiveContext, flowEnvelope, newstep).getAttributes())
+      //flowEnvelope.checkQuality(newstep)
+
+      subStepNumber += 1
+    })
+
+    if (flowEnvelope.hasAttribute(step + ".repairTable" )) repairTables(flowEnvelope.getAttribute(step + ".repairTable"), hiveContext)
+    
+    flowEnvelope
+  }
+
+  def putTempTableAsParquet(hiveContext: org.apache.spark.sql.hive.HiveContext, flowEnvelope: FlowEnvelope, step: String): DataFrameEnvelope = {
+    logger.info("Running putTempTableAsParquet")
+    val envelope: DataFrameEnvelope = new DataFrameEnvelope(step)
+    envelope.setAttribute(step + ".function-uuid", "f1720382-317a-4e4d-b0c3-be878b462786")
+    //envelope.mergeAttributesWithFilter(flowEnvelope.getAttributes(), step)
+    envelope.mergeAttributes(flowEnvelope.getAttributes())
+    envelope.setDataFrame(hiveContext.sql("select * from " + envelope.getAttribute(step + ".name")))
+
+
+
+    if (envelope.hasAttribute(step + ".codec")) {
+      hiveContext.setConf("spark.sql.parquet.compression.codec", envelope.getAttribute(step + ".codec"))
+    } else {
+      //Setting to the default codec, if none has been specified
+      hiveContext.setConf("spark.sql.parquet.compression.codec", "gzip")
+    }
+    if (envelope.hasAttribute(step + ".partition") && !envelope.getAttribute(step + ".partition").isEmpty  ) {
+      envelope.getDataFrame().coalesce(envelope.getOrDefault(step + ".coalesce", "1").toInt).write.format(envelope.getAttribute(step + ".format")).mode(envelope.getAttribute(step + ".saveMode")).partitionBy(envelope.getAttribute(step + ".partition").replaceAll("\\s", "").split(","): _*).save(envelope.getAttribute(step + ".location"))
+    } else {
+      envelope.getDataFrame().coalesce(envelope.getOrDefault(step + ".coalesce", "1").toInt).write.format(envelope.getAttribute(step + ".format")).mode(envelope.getAttribute(step + ".saveMode")).save(envelope.getAttribute(step + ".location"))
+    }
+
+    envelope
+
+  }
+
+  override def validate(flowEnvelope: FlowEnvelope, step: String): Boolean = {
+    logger.info("Verifying " + step)
+    var confGood = super.validate(flowEnvelope: FlowEnvelope, step: String)
+
+    if (!flowEnvelope.hasAttribute(step + ".saveListLiteral") && !flowEnvelope.hasAttribute(step + ".saveListFile")) {
+      logger.error(step + " is missing both saveListLiteral and saveListFile. One of the two must be defined for action putDataAsParquet.")
+      confGood = false
+    }
+    if (flowEnvelope.hasAttribute(step + ".saveListLiteral") && flowEnvelope.hasAttribute(step + ".saveListFile")) {
+      logger.error(step + " has attribute saveListLiteral and saveListFile. Only one can be defined for action putDataAsParquet.")
+      confGood = false
+    }
+    for (attribute <- Set("format", "saveMode")) {
+      if (!flowEnvelope.hasAttribute(step + "." + attribute)) {
+        logger.error(step + " is missing attribute " + attribute + ", which is required for action putDataAsParquet")
+        confGood = false
+      }
+    }
+
+    confGood
+  }
+
+  def setPartition(partitionValue: String, datasetName:String)={
+ var partitionCol : String = null
+
+    if(partitionValue.contains('|') || partitionValue.split(" ").length ==2)
+    {
+      val mp = getPartitionColumnsMap(partitionValue)
+      partitionCol= mp.get(datasetName.toLowerCase()).getOrElse("")
+     }else{
+      partitionCol= partitionValue
+    }
+
+    partitionCol
+  }
+
+  /*This method return Map for dataframe name and partition name
+  * */
+  def getPartitionColumnsMap(partitionValue: String) = {
+    try {
+      val list: List[String] = partitionValue.toLowerCase.split("\\|").toList
+      var partitionMap = new HashMap[String, String]()
+
+
+      for (partitions <- list) {
+        val partition = partitions.split(" ")
+        partitionMap.put(partition(0).trim.toLowerCase, partition(1).trim.toLowerCase)
+      }
+
+      partitionMap
+    }
+    catch {
+      case e: Exception => logger.error(PRINT_FROMATTER + "Error occurred while creating MAP for Partitions in PutDataParquet" + e)
+        throw e
+    }
+  }
+
+  
+  /**
+   * Updates partition info to hive for all tables specified.
+   * @param tablesToRepair
+   */
+  def repairTables(tablesToRepair: String, hiveContext: org.apache.spark.sql.hive.HiveContext){
+
+      tablesToRepair split(",") foreach( table =>{        
+        try{
+            hiveContext.sql("msck repair table " + table)
+        }catch{
+           case e: Exception => throw new Exception("There was an error in PutDataAsParquet processor while trying to repairTable " + table, e)
+        }
+      })  
+    
+  }
+}
