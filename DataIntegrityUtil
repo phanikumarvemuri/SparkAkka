@@ -1,0 +1,253 @@
+package com.bac.rctt.apps.flowbot.util 
+
+import com.bac.rctt.apps.flowbot.envelope.{DataFrameEnvelope, FlowEnvelope}
+import org.apache.spark.SparkContext
+import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.Row
+import org.apache.spark.sql.types.{StringType, StructField, StructType}
+import java.util.ArrayList
+import scala.collection.mutable.HashMap
+import com.bac.rctt.apps.flowbot.processors.BaseProcessor
+import org.apache.spark.sql.hive.HiveContext
+import org.apache.spark.sql.types.Decimal
+import org.apache.commons.lang3.StringUtils
+import org.apache.spark.sql.DataFrame
+
+/**
+* Date      		Developer                  	Change
+* ========= 		========================== 	===============================================================
+* 24-Aug-17    	Ramamurthy Pavan. N         1) Changed DataIntegrityUtil into a singleton object
+*                                           2) Added getSchemaFromHive method 
+* 29-Aug-17			Ramamurthy Pavan. N					Added performSumValidation method
+* 29-Aug-17			Sable Sneha									1) Added Header Trailer strip method
+* 																					2) Added Count Validation method
+* 																					3) Added Header Date Validation method
+* 																					4) Added getDiCheckValidationMap method
+* 31-Aug-17			Ramamurthy Pavan. N					Made changes as per the review comment in SEI-1184 "add sum validation for 1 column" story
+* 31-Aug-17			Sable Sneha									made changes to stripHeaderTrailer as per review comment
+* 07-Sep-17     Ankita Jain                 1) Fixed looping bug for sub steps
+*                                           2) updated schema extract method to exclude static column
+* 08-Sep-17			Ramamurthy Pavan. N					Modified performCountValidation method to accept countOffset parameter                                           
+* 11-Sep-17     Ankita Jain                 Made changes in performSumValidation to support sum on Empty DF
+* 13-Sep-17			Ramamurthy Pavan. N					Made changes to populate validation results as attributes on the envelope part of SEI-1406 story
+*  
+*/
+
+object DataIntegrityUtil extends BaseProcessor{
+ 
+  val PRINT_FROMATTER="******************"
+  
+  def performCountValidation(data: RDD[String], trailerCount: Int, countOffset: Int, hdrTrlrCount: Int, dataFrameEnvelope: DataFrameEnvelope, step: String) = {
+    logger.info("Running performCountValidation")
+    try{
+      var status = false
+      val fileCount = data.count() + hdrTrlrCount
+      dataFrameEnvelope.setAttribute(step + ".dataIntegrity.fileCount", fileCount.toString)
+      dataFrameEnvelope.setAttribute(step + ".dataIntegrity.trailerCount", trailerCount.toString)
+      dataFrameEnvelope.setAttribute(step + ".dataIntegrity.countOffset", countOffset.toString)
+      dataFrameEnvelope.setAttribute(step + ".dataIntegrity.countValStatus", "fail")      
+      if(fileCount == (trailerCount + countOffset)) {
+        status = true
+        dataFrameEnvelope.setAttribute(step + ".dataIntegrity.countValStatus", "pass")
+      }else{
+        val errMsg = "File record count does not match with trailer count + offset. File count is " + fileCount + " , trailer count is " + trailerCount + " and offset is " + countOffset
+        logger.error(PRINT_FROMATTER + errMsg)
+        throw new Exception(errMsg)
+      }
+      status
+    }catch{
+       case e: Exception => logger.error(PRINT_FROMATTER + "Error occured while performing count validation on given file."+ e)
+       throw e 
+    }
+  }
+  
+  
+  def stripHeaderTrailer(sc: SparkContext, fileContents: RDD[String], header: String, trailer: String) = {
+    logger.info("Running stripHeaderTrailer")
+    try{
+      val strippedHeader: RDD[String] = fileContents.filter(row => row != header)
+      val strippedTrailer: RDD[String] = strippedHeader.filter(row => row != trailer)
+      strippedTrailer
+    }catch{
+       case e: Exception => logger.error(PRINT_FROMATTER + "Error occured while running stripHeaderTrailer."+ e)
+       throw e
+    }  
+    
+  }
+  
+  def performHeaderDateValidation(fileHeaderRecord: RDD[String], headerIndex: Int, headerTrailerDelimiter: String, runtimeDate: String, dataFrameEnvelope: DataFrameEnvelope, step: String) = {
+    logger.info("Running performHeaderDateValidation")
+    try{
+      var dateCheckStatus = false
+      val fileHeaderDate = fileHeaderRecord.first.split(headerTrailerDelimiter)(headerIndex)
+     // val inputDate = flowEnvelope.getAttribute("flow.headerDate")
+      
+      dataFrameEnvelope.setAttribute(step + ".dataIntegrity.fileHeaderDate", fileHeaderDate)
+      dataFrameEnvelope.setAttribute(step + ".dataIntegrity.runtimeDate", runtimeDate)
+      dataFrameEnvelope.setAttribute(step + ".dataIntegrity.headerDateValStatus", "fail")
+      
+      if(fileHeaderDate.equals(runtimeDate)){
+        dateCheckStatus = true
+        dataFrameEnvelope.setAttribute(step + ".dataIntegrity.headerDateValStatus", "pass")
+      }else{
+        logger.error(PRINT_FROMATTER + "Header record date does not match with input runtime headerDate. Header record date is "+fileHeaderDate+" and input header date is "+runtimeDate)
+        throw new Exception("Header record date does not match with input runtime headerDate. Record header date is "+fileHeaderDate+" and input header date is "+runtimeDate)
+      }
+      dateCheckStatus
+    }catch{
+     case e: Exception => logger.error(PRINT_FROMATTER + "Error occured while performing header date validation."+ e)
+     throw e 
+    }
+  }
+  
+   def getDIValidationCheckMap(columnsCheck: Array[String]) = {
+     try{
+       var mp = new HashMap[String, ArrayList[String]]()
+       var countCheck = new ArrayList[String]()
+       var sumCheck = new ArrayList[String]()
+       var dateCheck = new ArrayList[String]()
+       for(col <- columnsCheck){
+         val chkColumn = col.split(",")
+         (chkColumn(0).trim().toUpperCase()) match{
+           case "COUNT" => countCheck.add(col)
+                           mp.put("COUNT", countCheck)
+           case "SUM" => sumCheck.add(col)
+                         mp.put("SUM", sumCheck)
+           case "DATE" => dateCheck.add(col)
+                         mp.put("DATE", dateCheck)
+           case _ => 
+           
+         }
+      }
+      mp
+     }catch{
+       case e: Exception => logger.error(PRINT_FROMATTER + "Error occured while running getDIValidationCheckMap."+ e)
+       throw e
+     }
+  }
+
+  /**
+    * This method accepts Hive DatabaseName.tablename, HiveContext ,DataFrameEnvelope and step as arguments and returns a Schema instance.
+    */
+  def getSchemaFromHive(hiveTable: String, hiveContext: HiveContext , envelope: DataFrameEnvelope,step:String): StructType = {
+    logger.info("Running getSchemaFromHive")
+    try{
+      var targetSchema: StructType = null
+      if(envelope.hasAttribute(step + ".excludeColumn")) {
+        envelope.setAttribute(step + ".dropColumns", getDropColumns(envelope.getAttribute(step + ".excludeColumn"), envelope.getAttribute(step + ".name")))
+        envelope.setDataFrame(hiveContext.table(hiveTable))
+        targetSchema = envelope.getDataFrame().schema
+        envelope.removeAttribute(step + ".dropColumns")
+      }else
+        targetSchema = hiveContext.table(hiveTable).schema
+
+      targetSchema.printTreeString()
+
+      targetSchema
+    }catch{
+      case e: Exception => logger.error(PRINT_FROMATTER + "Error occured while running getSchemaFromHive." + e)
+        throw e
+    }
+  }
+
+  /**
+    * This method reads arguments with dataSetName.columns and return comma sapreated column names for that dataSet.
+    */
+  def getDropColumns(value : String,dataSetName : String): String={
+
+    val list : List[String] = value.toLowerCase.split(",").toList
+    var columnList  = List[String]()
+
+    list.foreach(item => if(item.toLowerCase.contains(dataSetName)){
+      columnList = columnList :+  item.replace(dataSetName+".","")
+    }
+    )
+
+    return columnList.mkString(",")
+  }
+  
+  def performSumValidation(sourceDF: DataFrame, trailerSum: Decimal, sumDICheckStr: String, hiveContext: HiveContext, dataFrameEnvelope: DataFrameEnvelope, step: String) : Boolean = {
+    logger.info("Running performSumValidation")
+    try {
+      var status = true
+      var hasPrecision = false
+      val sumDICheckStrArray : Array[String] = sumDICheckStr.split(",")
+      val sumCheckCol = sumDICheckStrArray(2).trim
+      
+      if((sumDICheckStrArray.length == 3) && !sumDICheckStr.toUpperCase().contains("PRECISION")) {
+        hasPrecision = false
+      } else if((sumDICheckStrArray.length == 5) && sumDICheckStr.toUpperCase().contains("PRECISION")) {
+        hasPrecision = true
+      }      
+      
+      // Column existence check in table schema
+      val fieldNamesArr : Array[String] = sourceDF.schema.fieldNames
+      if(!fieldNamesArr.contains(sumCheckCol)) {
+        status = false
+        throw new Exception("Column specified in SUM check not exists in table schema. Given column name is " + sumCheckCol 
+            + " and table schema fields are " + fieldNamesArr.reduce(_ + "," + _))    
+      }
+      
+      val aggVal = sourceDF.agg(Map(sumCheckCol -> "sum")).head().mkString
+
+      //Initialized with 0 to handle empty DF as spark return null after applying sum on empty DF
+      var fileSum = Decimal.apply(0)
+
+      if(!aggVal.equals("null"))
+        fileSum = Decimal.apply(aggVal)
+        
+      dataFrameEnvelope.setAttribute(step + ".dataIntegrity.fileSum", fileSum.toString)
+      dataFrameEnvelope.setAttribute(step + ".dataIntegrity.sumCheckCol", sumCheckCol)
+      dataFrameEnvelope.setAttribute(step + ".dataIntegrity.trailerSum", trailerSum.toString)
+      dataFrameEnvelope.setAttribute(step + ".dataIntegrity.sumValStatus", "pass")
+
+      if(!hasPrecision) {
+        if(fileSum.compareTo(trailerSum) != 0) {
+          status = false
+          dataFrameEnvelope.setAttribute(step + ".dataIntegrity.sumValStatus", "fail")
+          throw new Exception("Trailer sum check failed! column " + sumCheckCol + " sum is " + fileSum +  " and trailer sum is " + trailerSum)
+        }          
+      } else {
+          val precision = StringUtils.substringAfter(sumDICheckStrArray(3),"(").trim.toInt
+          val scale = StringUtils.substringBefore(sumDICheckStrArray(4),")").trim.toInt
+          
+          var validPrecisionForFileSum = true;
+          var validPrecisionForTrailerSum = true;
+          
+				  if(!fileSum.isZero) {
+				    validPrecisionForFileSum = fileSum.changePrecision(precision, scale);
+				  }          
+          if(!trailerSum.isZero){
+				    validPrecisionForTrailerSum = trailerSum.changePrecision(precision, scale);
+				  }
+          
+          if(!validPrecisionForFileSum) {
+            status = false
+            dataFrameEnvelope.setAttribute(step + ".dataIntegrity.sumValStatus", "fail")
+            throw new Exception("Not able to apply the precision to FileSum")
+          }
+          if(!validPrecisionForTrailerSum) {
+            status = false
+            dataFrameEnvelope.setAttribute(step + ".dataIntegrity.sumValStatus", "fail")
+            throw new Exception("Not able to apply the precision to TrailerSum")
+          }
+         
+          dataFrameEnvelope.setAttribute(step + ".dataIntegrity.fileSum", fileSum.toString)
+          dataFrameEnvelope.setAttribute(step + ".dataIntegrity.trailerSum", trailerSum.toString)
+          
+          if(fileSum.compareTo(trailerSum) != 0) {
+            status = false
+            dataFrameEnvelope.setAttribute(step + ".dataIntegrity.fileSum", fileSum.toString)
+            dataFrameEnvelope.setAttribute(step + ".dataIntegrity.trailerSum", trailerSum.toString)            
+            dataFrameEnvelope.setAttribute(step + ".dataIntegrity.sumValStatus", "fail")
+            throw new Exception("Trailer sum check failed! column " + sumCheckCol + " sum is " + fileSum +  " and trailer sum is " + trailerSum)
+          }          
+      }
+      
+      status
+    }catch{
+       case e: Exception => logger.error(PRINT_FROMATTER + "Error occured while performing sum validation on given file."+ e)
+       throw e 
+    }    
+  }
+}
