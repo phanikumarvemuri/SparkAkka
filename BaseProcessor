@@ -1,0 +1,87 @@
+package flowbot.processors
+
+import java.io.{InputStream, InputStreamReader}
+
+import com.bac.rctt.apps.flowbot.envelope.{DataFrameEnvelope, FlowEnvelope}
+import com.google.common.base.Charsets
+import com.google.common.io.CharStreams
+import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.fs.{FileSystem, Path}
+import org.apache.log4j.Logger
+import org.apache.spark.sql.DataFrame
+
+
+abstract class BaseProcessor() {
+  val logger: Logger = Logger.getLogger(getClass.getName)
+
+  def validate(flowEnvelope: FlowEnvelope, step: String): Boolean = {
+    var confGood = true
+    if( !flowEnvelope.hasAttribute(step + ".enabled") ){
+      logger.error(step + " is missing attribute enabled")
+      confGood = false
+    }
+    if (!flowEnvelope.hasAttribute(step + ".type")) {
+      logger.error(step + " is missing attribute type")
+      confGood = false
+    }
+    if (!flowEnvelope.hasAttribute(step + ".name")) {
+      logger.error(step + " is missing attribute name")
+      confGood = false
+    }
+
+    confGood
+  }
+
+
+  def hdfsFileAsString(hdfsFile: String, flowEnvelope: FlowEnvelope): String = {
+
+  val fs: FileSystem = FileSystem.get(new Configuration())
+  val stream: InputStream = fs.open(new Path(hdfsFile))
+  val reader: InputStreamReader = new InputStreamReader(stream, Charsets.UTF_8)
+  var contents: String = CharStreams.toString(reader)
+  reader.close()
+  stream.close()
+ // val pattern = """((\$\{\w{1,15}\.\w{1,15}\.\w{1,15}\.\w{1,15}})+.*?)+""".r
+    val pattern = """(\$\{.*?})+""".r
+
+  pattern.findAllIn(contents).matchData foreach { m =>
+{
+  contents = contents.replace(m.group(1), flowEnvelope.getAttribute(m.group(1).replace("$", "").replace("}", "").replace("{", "")))
+}
+}
+  contents
+}
+
+  /*
+  def applyStandardizationPolicy(df: DataFrame, envelope: DataFrameEnvelope, policyName: String): DataFrame = {
+    import org.apache.spark.sql.functions._
+    import org.apache.spark.sql.types.StringType
+
+    logger.info("Applying Policy " + policyName + ".standardization")
+
+    df.select(df.schema.fields.flatMap(f =>
+      f.dataType match {
+        case StringType =>
+
+          if (envelope.hasAttribute(policyName + ".standardization.emptyToNull") && !envelope.hasAttribute(policyName + ".standardization.trimStrings")) {
+            logger.debug("Applying emptyToNull") :: Nil
+            when(trim(df.col(f.name)).equalTo(""), null).otherwise(df.col(f.name)).as(f.name) :: Nil
+          } else { df.col(f.name) :: Nil }
+
+          if (envelope.hasAttribute(policyName + ".standardization.trimStrings") == true && envelope.hasAttribute(policyName + ".standardization.emptyToNull") == false) {
+            logger.debug("Applying trimStrings") :: Nil
+            when(df.col(f.name).isNotNull, trim(df.col(f.name))).otherwise(df.col(f.name)).as(f.name) :: Nil
+          } else { df.col(f.name) :: Nil }
+
+          if (envelope.hasAttribute(policyName + ".standardization.trimStrings") && envelope.hasAttribute(policyName + ".standardization.emptyToNull")) {
+            logger.debug("Applying trimStrings and emptyToNull") :: Nil
+            when(df.col(f.name).isNotNull && !df.col(f.name).equalTo(""), trim(df.col(f.name))).otherwise(when(df.col(f.name).equalTo(""), null).otherwise(df.col(f.name))).as(f.name) :: Nil
+          } else { df.col(f.name) :: Nil }
+
+        case _ => col(f.name) :: Nil
+      }): _*)
+
+  } */
+  
+  
+}
