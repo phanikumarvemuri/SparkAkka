@@ -1,0 +1,33 @@
+package flowbot.processors
+
+import com.bac.rctt.apps.flowbot.envelope.FlowEnvelope
+import org.apache.spark.SparkContext
+
+import scala.sys.process._
+
+class ExecuteScript()  extends BaseProcessor {
+  def run(sc: SparkContext, hiveContext: org.apache.spark.sql.hive.HiveContext, flowEnvelope: FlowEnvelope, step: String) = {
+    val command = flowEnvelope.getAttribute(step + ".location")
+    logger.info("Excecuting script: " + command)
+    val output: String = command !!
+
+    flowEnvelope.setAttribute(step  + ".output", output)
+
+    logger.info(flowEnvelope.getAttribute(step + ".name") + " returning " + output)
+
+    flowEnvelope
+  }
+
+
+  override def validate(flowEnvelope: FlowEnvelope, step: String): Boolean = {
+    logger.info("Verifying " + step)
+    var confGood = super.validate(flowEnvelope: FlowEnvelope, step: String)
+
+    if (!flowEnvelope.hasAttribute(step + ".location")) {
+      logger.error(step + " is missing attribute location, which is required for action executeScript")
+      confGood = false
+    }
+
+    confGood
+  }
+}
