@@ -1,0 +1,43 @@
+
+package logging;
+
+import java.io.Closeable;
+import java.io.IOException;
+
+import org.apache.avro.file.SeekableInput;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FSDataInputStream;
+import org.apache.hadoop.fs.Path;
+
+public class SeekableInputStream implements Closeable, SeekableInput {
+
+	private final FSDataInputStream stream;
+	private final long len;
+
+	public SeekableInputStream(Path path, Configuration conf)
+			throws IOException {
+		this.stream = path.getFileSystem(conf).open(path);
+		this.len = path.getFileSystem(conf).getFileStatus(path).getLen();
+	}
+
+	public long length() {
+		return this.len;
+	}
+
+	public int read(byte[] b, int off, int len) throws IOException {
+		return this.stream.read(b, off, len);
+	}
+
+	public void seek(long p) throws IOException {
+		this.stream.seek(p);
+	}
+
+	public long tell() throws IOException {
+		return this.stream.getPos();
+	}
+
+	public void close() throws IOException {
+		this.stream.close();
+	}
+
+}
