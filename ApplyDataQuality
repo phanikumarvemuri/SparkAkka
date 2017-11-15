@@ -1,0 +1,283 @@
+package flowbot.processors
+
+
+import java.util.HashMap
+
+import com.bac.ecr.hdf.components.dataquality.DQComponent
+import com.bac.ecr.hdf.components.utils.commonutils.HdfsUtils
+import com.bac.ecr.hdf.frameworks.logging.HadoopLogger.DDI_LAYER
+import com.bac.ecr.hdf.frameworks.logging.{HadoopLogFactory, HadoopLogger}
+import com.bac.rctt.apps.flowbot.envelope.{DataFrameEnvelope, FlowEnvelope}
+import com.bac.rctt.apps.flowbot.util.Functions
+import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.fs.{FileSystem, Path}
+import org.apache.spark.SparkContext
+import org.apache.spark.api.java.JavaSparkContext
+import org.apache.spark.sql.{DataFrame, Row}
+import org.apache.spark.sql.hive.HiveContext
+import org.apache.spark.sql.types.{DataType, StringType, StructField, StructType}
+import org.json.{JSONArray, JSONObject}
+
+
+
+class ApplyDataQuality() extends BaseProcessor {
+
+  val PRINT_FORMATTER = "******************"
+  implicit val formats = org.json4s.DefaultFormats
+
+  /**
+    * This method invokes DQ component in pipeline mode using DQComponent.ValidateInternal() method
+    * @param sc SparkContext
+    * @param hiveContext
+    * @param flowEnvelope
+    * @param step
+    * @return FlowEnvelope
+    */
+  def run(sc: SparkContext, hiveContext: org.apache.spark.sql.hive.HiveContext, flowEnvelope: FlowEnvelope, step: String): FlowEnvelope = {
+    logger.info(PRINT_FORMATTER + "Running ApplyDataQuality")
+    try {
+      var inputDfLiteral: String = {
+        if (flowEnvelope.hasAttribute(step + ".dataFrameLiteral")) {
+          flowEnvelope.getAttribute(step + ".dataFrameLiteral")
+        } else {
+          hdfsFileAsString(flowEnvelope.getAttribute(step + ".dataFrameFile"), flowEnvelope)
+        }
+      }
+
+      var subStepNumber = 1
+
+      inputDfLiteral.trim().split(";").foreach(df => {
+        logger.info(PRINT_FORMATTER + "Item to execute:" + df)
+        val newstep = step + "-" + subStepNumber
+        logger.info(PRINT_FORMATTER + "New Step Name:" + newstep)
+
+        val dfString: Array[String] = df.split('|')
+
+        logger.info(PRINT_FORMATTER + "DataFrame to execute:" + dfString(0).trim())
+        logger.info(PRINT_FORMATTER + "Filter Condition used:" + dfString(1).trim())
+        logger.info(PRINT_FORMATTER + "Rule Json Path used :" + dfString(2).trim())
+        logger.info(PRINT_FORMATTER + "Primary Key used :" + dfString(3).trim())
+
+        if (dfString.length < 3 || dfString.length < 4) {
+          logger.error("One of the mandatory parameter ruleJsonPath or Primary key is missing in the dataframe property in conf.")
+          throw new Exception("One of the mandatory parameter ruleJsonPath or Primary key is missing in the dataframe property in conf.")
+        }
+
+
+        flowEnvelope.cloneAttributes(step, newstep)
+        flowEnvelope.setAttribute(newstep + ".name", dfString(0).trim())
+        flowEnvelope.setAttribute(newstep + ".dataFrame", dfString(0).trim())
+        flowEnvelope.setAttribute(newstep + ".feedName", dfString(0).trim())
+        flowEnvelope.setAttribute(newstep + ".rulePath", dfString(2).trim())
+        flowEnvelope.setAttribute(newstep + ".pkFields", dfString(3).trim())
+
+        if (!dfString(1).trim().isEmpty) {
+          flowEnvelope.setAttribute(newstep + ".filterCondition", dfString(1).trim())
+        }
+        if (dfString.length > 4){
+          flowEnvelope.setAttribute(newstep + ".summaryDataFrameName", dfString(4).trim())
+        }
+        if (dfString.length > 5){
+          flowEnvelope.setAttribute(newstep + ".detailDataFrameName", dfString(5).trim())
+        }
+        if (dfString.length > 6){
+          flowEnvelope.setAttribute(newstep + ".feedSummaryDataFrameName", dfString(6).trim())
+        }
+
+
+        if (flowEnvelope.hasAttribute(step + ".groupFields")) {
+          flowEnvelope.setAttribute(newstep + ".groupFields", flowEnvelope.getAttribute(step + ".groupFields"))
+        }
+        if (flowEnvelope.hasAttribute(step + ".persistAllRecordsIntoDetail")) {
+          flowEnvelope.setAttribute(newstep + ".persistAllRecordsIntoDetail", flowEnvelope.getAttribute(step + ".persistAllRecordsIntoDetail"))
+        }
+
+        logger.info(PRINT_FORMATTER + "found executeDQ step. Going to pass '" + newstep + "' to sp.getHDPFDQ")
+        flowEnvelope.mergeAttributes(getHDPFDQ(sc, hiveContext, flowEnvelope, newstep).getAttributes())
+        subStepNumber += 1
+      })
+      flowEnvelope
+    } catch {
+      case e: Exception => logger.error(PRINT_FORMATTER + "Error occured while running ApplyDataQuality." + e)
+        throw e
+    }
+  }
+
+  /**
+    * Invokes DQ component
+    * @param sc SparkContext
+    * @param hiveContext
+    * @param flowEnvelope
+    * @param step
+    * @return DataFrameEnvelope
+    */
+  def getHDPFDQ(sc: SparkContext, hiveContext: org.apache.spark.sql.hive.HiveContext, flowEnvelope: FlowEnvelope, step: String): DataFrameEnvelope = {
+
+    val envelope = new DataFrameEnvelope(step)
+    envelope.setAttribute(step + ".function-uuid", Functions.getUUID())
+    envelope.mergeAttributes(flowEnvelope.getAttributes())
+    // var inputDF = inputEnvelopeDF.getDataFrame()
+
+    val conf: Configuration = new Configuration()
+    val fs: FileSystem = FileSystem.get(conf)
+    val jsc = JavaSparkContext.fromSparkContext(sc)
+
+    val hadoopLogger: HadoopLogger = HadoopLogFactory.getInstance(getClass.getSimpleName, DDI_LAYER.DATA_QUALITY, jsc.applicationId, jsc.hadoopConfiguration())
+    val configJson = getConfigJson(flowEnvelope, step)
+    val dqRulesJSON: JSONObject = new JSONObject(HdfsUtils.readHdfsFile(fs, new Path(flowEnvelope.getAttribute(step + ".rulePath"))))
+    val inputDF: DataFrame = {
+      try {
+        if (flowEnvelope.hasAttribute(step + ".filterCondition") && !flowEnvelope.getAttribute(step + ".filterCondition").isEmpty) {
+          hiveContext.sql(" select * from " + flowEnvelope.getAttribute(step + ".dataFrame") + " where " + flowEnvelope.getAttribute(step + ".filterCondition"))
+        } else {
+          hiveContext.sql(" select * from " + flowEnvelope.getAttribute(step + ".dataFrame"))
+        }
+      } catch {
+        case e: Exception => {
+          logger.error("e.getMessage(): " + e.getMessage);
+          logger.error("Failed while loading dataframe: " + flowEnvelope.getAttribute(step + ".dataFrame"))
+          throw e
+        }
+      }
+    }
+    val inputEnvelopeDF = new DataFrameEnvelope(step)
+    inputEnvelopeDF.mergeAttributes(flowEnvelope.getAttributes())
+    inputEnvelopeDF.setDataFrame(inputDF)
+
+
+    //Create DataFrameEnvelopes
+    val detailEnvelopeDF = new DataFrameEnvelope(step)
+    val summaryEnvelopeDF = new DataFrameEnvelope(step)
+    val feedSummaryEnvelopeDF = new DataFrameEnvelope(step)
+    //Merge flowEnvelope
+    summaryEnvelopeDF.mergeAttributes(flowEnvelope.getAttributes())
+    detailEnvelopeDF.mergeAttributes(flowEnvelope.getAttributes())
+    feedSummaryEnvelopeDF.mergeAttributes(flowEnvelope.getAttributes())
+
+    summaryEnvelopeDF.setAttribute(step + ".name", flowEnvelope.getOrDefault(step + ".summaryDataFrameName", "summaryDataFrame"))
+    detailEnvelopeDF.setAttribute(step + ".name", flowEnvelope.getOrDefault(step + ".detailDataFrameName", "detailDataFrame"))
+    feedSummaryEnvelopeDF.setAttribute(step + ".name", flowEnvelope.getOrDefault(step + ".feedSummaryDataFrameName", "feedSummaryDataFrame"))
+
+    //Get DQMap from HDPF DQ pipeline method
+    val retDFMap: HashMap[String, DataFrame] = DQComponent.ValidateInternal(inputDF, configJson, dqRulesJSON, hiveContext, hadoopLogger)
+
+    //Which DataFrames to fetch
+    val summary = flowEnvelope.getOrDefault(step + ".getSummary", "false").toBoolean
+    val detail = flowEnvelope.getOrDefault(step + ".getDetail", "false").toBoolean
+    val feedSummary = flowEnvelope.getOrDefault(step + ".getFeedSummary", "false").toBoolean
+
+    //Converting NullType to StringType while setting output dataframe
+    // if dataframe is null an empty dataframe is created
+    val detailSchema = "original_ids input_data_string summary_id rule_id rule_output"
+    val summarySchema = "application control_point count_records_failed count_records_passed data_flow_name dqi_obtained dqi_threshold dqm_obtained dqm_threshold execution_datetime execution_elapsed feed_name group_field10_name group_field10_value group_field1_name group_field1_value group_field2_name group_field2_value group_field3_name group_field3_value group_field4_name group_field4_value group_field5_name group_field5_value group_field6_name group_field6_value group_field7_name group_field7_value group_field8_name group_field8_value group_field9_name group_field9_value pde_location pde_name pde_object_name pde_source period_date product rule_description rule_id rule_passed_flag rule_run severity sum_records_failed sum_records_passed summary_id validator_run"
+    val feedSummarySchema = "application control_point data_flow_name execution_datetime execution_elapsed feed_arrival_datetime feed_expected_end_datetime feed_expected_start_datetime feed_id feed_name feed_publication_datetime feed_publication_expected_datetime feed_publication_id feedsource period_date product rule_description rule_passed_flag rule_run severity summary_id validator_run"
+
+
+    val summaryDF =  castColumns(retDFMap.get("Summary"),summarySchema,hiveContext, sc)
+    val detailDF = castColumns(retDFMap.get("Detail"),detailSchema,hiveContext, sc)
+    val feedSummaryDF =  castColumns(retDFMap.get("FeedSummary"),feedSummarySchema,hiveContext, sc)
+
+    if (summary){
+      summaryEnvelopeDF.setDataFrame(summaryDF)
+      envelope.mergeAttributes(summaryEnvelopeDF.getAttributes())
+    }
+    if (detail){
+      detailEnvelopeDF.setDataFrame(detailDF)
+      envelope.mergeAttributes(detailEnvelopeDF.getAttributes())
+    }
+    if (feedSummary) {
+      feedSummaryEnvelopeDF.setDataFrame(feedSummaryDF)
+      envelope.mergeAttributes(feedSummaryEnvelopeDF.getAttributes())
+    }
+
+    envelope.setAttribute(step + ".status", "true")
+    envelope
+  }
+
+  /**
+    * Casts NullType columns to string in dataframe
+    * @param dataframe
+    * @param schema - schema in case dataframe is null. Should be in the format 'name0 name1 name2'
+    * @param hiveContext
+    * @param sparkContext
+    * @return dataframe with casted columns; if dataframe is null it will return an empty dataframe.
+    */
+  def castColumns(dataframe: DataFrame, schema: String, hiveContext: HiveContext, sc: SparkContext) : DataFrame ={
+    var auxDF = dataframe
+    if (dataframe != null) {
+      dataframe.schema filter(_.dataType.toString().equals("NullType")) foreach(col =>{
+        auxDF = castColumnTo(auxDF, col.name, StringType)
+      })
+      auxDF
+    }else{
+      hiveContext.createDataFrame(sc.emptyRDD[Row], StructType(schema.split(" ").map(fieldName => StructField(fieldName, StringType, true))))
+    }
+  }
+
+  def castColumnTo( df: DataFrame, cn: String, tpe: DataType ) : DataFrame = {
+    df.withColumn( cn, df(cn).cast(tpe) )
+  }
+
+  def getConfigJson(flowEnvelope: FlowEnvelope, step: String): JSONObject = {
+    try {
+
+      val configJson: JSONObject = new JSONObject()
+      val pkFieldsArray: Array[String] = flowEnvelope.getAttribute(step + ".pkFields").trim().split(",")
+
+      configJson.put("ControlPoint", flowEnvelope.getAttribute(step + ".controlPoint"))
+      configJson.put("DataFlow", flowEnvelope.getAttribute(step + ".dataFlow"))
+      configJson.put("PeriodDate", flowEnvelope.getAttribute(step + ".periodDate"))
+      configJson.put("FeedName", flowEnvelope.getAttribute(step + ".feedName"))
+      configJson.put("Application", flowEnvelope.getAttribute(step + ".application"))
+      configJson.put("Product", flowEnvelope.getAttribute(step + ".product"))
+      configJson.put("pkFields", new JSONArray(pkFieldsArray))
+
+      if (flowEnvelope.hasAttribute(step + ".groupFields")) {
+        val groupFieldsArray: Array[String] = flowEnvelope.getAttribute(step + ".groupFields").trim().split(",")
+        configJson.put("groupFields", new JSONArray(groupFieldsArray))
+      }
+      if (flowEnvelope.hasAttribute(step + ".persistAllRecordsIntoDetail")) {
+        configJson.put("persistAllRecordsIntoDetail", flowEnvelope.getAttribute(step + ".persistAllRecordsIntoDetail").toBoolean)
+      }
+
+      configJson
+
+    } catch {
+      case e: Exception => logger.error(PRINT_FORMATTER + "Error occured while running getConfigJSON of ApplyDataQuality." + e)
+        throw e
+    }
+  }
+
+  override def validate(flowEnvelope: FlowEnvelope, step: String): Boolean = {
+    logger.info(PRINT_FORMATTER + "Verifying " + step)
+    var confGood = super.validate(flowEnvelope: FlowEnvelope, step: String)
+
+    for (attribute <- Set("periodDate", "dataFlow", "controlPoint", "getSummary", "getDetail")) {
+      if (!flowEnvelope.hasAttribute(step + "." + attribute)) {
+        logger.error(step + " is missing attribute " + attribute + ", which is required for processor ApplyDataQuality.")
+        confGood = false
+      }
+    }
+    if (!flowEnvelope.hasAttribute(step + ".getSummary") && !flowEnvelope.hasAttribute(step + ".getDetail")) {
+      logger.warn(step + " is missing both getSummary and getDetail. Both will default to false and neither will be fetched.")
+
+    } else if ((flowEnvelope.hasAttribute(step + ".getSummary") && flowEnvelope.hasAttribute(step + ".getDetail")) &&
+      !flowEnvelope.getAttribute(step + ".getSummary").toBoolean && !flowEnvelope.getAttribute(step + ".getDetail").toBoolean) {
+      logger.warn(step + ".getSummary and " + step + ".getDetail are both set to false and neither will be fetched.")
+    }
+
+    if (!flowEnvelope.hasAttribute(step + ".dataFrameLiteral") && !flowEnvelope.hasAttribute(step + ".dataFrameFile")) {
+      logger.error(step + " is missing both dataFrameLiteral and dataFrameFile. One of the two must be defined for action ApplyDataQuality.")
+      confGood = false
+    }
+    if (flowEnvelope.hasAttribute(step + ".dataFrameLiteral") && flowEnvelope.hasAttribute(step + ".dataFrameFile")) {
+      logger.error(step + " has attribute dataFrameLiteral and dataFrameFile. Only one can be defined for action ApplyDataQuality.")
+      confGood = false
+    }
+
+    if (!confGood) {
+      throw new Exception("One or more of the mandatory properties is missing in the .conf file. Please check the logger for more details on missing properties.")
+    }
+    confGood
+  }
+}
