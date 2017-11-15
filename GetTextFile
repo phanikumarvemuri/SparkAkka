@@ -1,0 +1,298 @@
+package com.bac.rctt.apps.flowbot.processors
+
+import com.bac.rctt.apps.flowbot.envelope.{DataFrameEnvelope, FlowEnvelope}
+import org.apache.spark.SparkContext
+import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.types.{StructType}
+import java.util.ArrayList
+import com.bac.ecr.hdf.components.utils.commonutils.SchemaOperationsUtil
+import scala.collection.mutable.HashMap
+import org.apache.spark.sql.DataFrame
+import com.bac.rctt.apps.flowbot.util.DataIntegrityUtil
+import org.apache.spark.sql.hive.HiveContext
+import org.apache.spark.sql.types.Decimal
+import org.apache.spark.sql.Row
+import org.apache.spark.sql.types.StringType
+import org.apache.spark.sql.types.StructField
+
+
+
+
+class GetTextFile() extends BaseProcessor {
+  
+  val PRINT_FROMATTER="******************"
+  implicit val formats = org.json4s.DefaultFormats
+  var doCount, doSum, doDateCheck, stripHeader, stripTrailer : Boolean = false
+  var diCheckMap = new HashMap[String, ArrayList[String]]()
+  
+  def run(sc: SparkContext, hiveContext: HiveContext, flowEnvelope: FlowEnvelope, step: String): FlowEnvelope = {
+    try{
+      var locationOnly = false
+  
+      var getItemList: String = {
+        if (flowEnvelope.hasAttribute(step + ".getListLiteral")) {
+          flowEnvelope.getAttribute(step + ".getListLiteral")
+        } else {
+          hdfsFileAsString(flowEnvelope.getAttribute(step + ".getListFile"), flowEnvelope)
+      }}
+      var subStepNumber = 1
+  
+      getItemList.trim().split(";").foreach(getItem => {
+        logger.info("Item to execute:" + getItem)
+        var newstep = step + "-" + subStepNumber
+        logger.info("New Step Name:" + newstep)
+  
+        flowEnvelope.cloneAttributes(step, newstep)
+        
+        val literalString: Array[String] = getItem.split("\\|",4)
+        logger.info(PRINT_FROMATTER+"File Location used:" + literalString(0).trim())
+        logger.info(PRINT_FROMATTER+"Output Dataframe used :" + literalString(1).trim())
+        logger.info(PRINT_FROMATTER+"Schema Table used :" + literalString(2).trim())
+          
+        if(literalString.length<2 || literalString.length<3){
+          logger.error("One of the mandatory parameter Output Dataframe Name or Schema Table Name is missing in the getListLiteral/getListFile property in conf.")
+          throw new Exception("One of the mandatory parameter Output Dataframe Name or Schema Table Name is missing in the getListLiteral/getListFile property in conf.")
+        }
+        flowEnvelope.setAttribute(newstep + ".location",  literalString(0).trim())
+        flowEnvelope.setAttribute(newstep + ".name",  literalString(1).trim())
+        flowEnvelope.setAttribute(newstep + ".schema",  literalString(2).trim())
+        
+        if(literalString.length>3){
+          flowEnvelope.setAttribute(newstep + ".diChecks", literalString(3).trim())
+          logger.info(PRINT_FROMATTER+"DiChecks used :" + literalString(3).trim())
+        }
+
+        if(flowEnvelope.hasAttribute(step + ".headerDate")){
+          flowEnvelope.setAttribute(newstep + ".headerDate", flowEnvelope.getAttribute(step + ".headerDate"))
+        }
+        logger.info("found getTextFile step! Going to pass '" + newstep + "' to sp.getTextFile")
+        flowEnvelope.mergeAttributes(getTextFile(sc, hiveContext, flowEnvelope, newstep).getAttributes())
+        //flowEnvelope.checkQuality(newstep)
+      })
+
+      subStepNumber += 1
+
+      flowEnvelope
+     }catch{
+        case e: Exception => logger.error(PRINT_FROMATTER + "Error occured while running GetTextFile."+ e)
+        throw e
+     }
+  }
+ 
+  def getTextFile(sc: SparkContext, hiveContext: HiveContext, flowEnvelope: FlowEnvelope, step: String): DataFrameEnvelope = {
+    logger.info("Running getTextFile")
+    try{
+      var data : RDD[String] = sc.textFile(flowEnvelope.getAttribute(step + ".location"))
+      val envelope = new DataFrameEnvelope(step)
+      envelope.setAttribute(step + ".function-uuid", "2c85bbe2-64fb-4a1d-beab-ce10f3b2f2fa")
+      envelope.mergeAttributes(flowEnvelope.getAttributes())
+  
+      identifyDiChecks(flowEnvelope, step)
+
+      val schemaString = flowEnvelope.getAttribute(step + ".schema")
+      var schema: StructType = null
+      if(schemaString.contains(".")) {
+        schema = DataIntegrityUtil.getSchemaFromHive(schemaString, hiveContext ,envelope,step)
+      } else {
+        schema = StructType(schemaString.split(" ").map(fieldName => StructField(fieldName, StringType, true)))
+      }
+
+      val (status, sourceDF) = performDI(sc, hiveContext, envelope, data, schema, step)
+
+
+      if(status) {
+        envelope.setDataFrame(sourceDF)
+      } else {
+        throw new Exception("DI checks on " + flowEnvelope.getAttribute(step + ".location") + " file failed")
+      }      
+
+      envelope
+    }catch{
+      case e: Exception => logger.error(PRINT_FROMATTER + "Error occured while running getTextFile."+ e)
+      throw e 
+    }
+  }
+  
+   def identifyDiChecks(flowEnvelope: FlowEnvelope, step: String) = {
+    try{
+      
+      if(!(flowEnvelope.hasAttribute(step + ".hasHeaderTrailer") && (flowEnvelope.getAttribute(step + ".hasHeaderTrailer").equalsIgnoreCase("FALSE")))){
+        stripHeader = true
+        stripTrailer = true
+      }
+      
+      if(flowEnvelope.hasAttribute(step + ".diChecks")){
+        diCheckMap = DataIntegrityUtil.getDIValidationCheckMap(flowEnvelope.getAttribute(step + ".diChecks").replace("[","").replace("]","").trim().split('|'))
+        if(diCheckMap.contains("COUNT")){
+          doCount = true
+        }
+        if(diCheckMap.contains("DATE")){
+          doDateCheck = true
+        }
+        if(diCheckMap.contains("SUM")){
+          doSum = true
+        }
+        
+      }
+      
+    }catch{
+       case e: Exception => logger.error(PRINT_FROMATTER + "Error occured while running identifyDiChecks."+ e)
+       throw e 
+    }
+  }
+  
+   def performDI(sc: SparkContext, hiveContext: HiveContext, dataFrameEnvelope: DataFrameEnvelope, fileContents: RDD[String], schema: StructType, step: String) = {
+    logger.info("Running performDI")
+    try{
+      var status: Boolean = true
+      var countStatus, dateStatus, sumStatus : Boolean = true
+      var strippedData = fileContents
+      var sourceDF : DataFrame = null
+      var tail : Array[String] = null
+      
+      if((dataFrameEnvelope.getAttribute(step + ".hasHeaderTrailer") == "true") && fileContents.isEmpty()) {
+        logger.error(PRINT_FROMATTER + step + " has attribute hasHeaderTrailer set to true but the text file is empty.")
+        throw new Exception(step + " has attribute hasHeaderTrailer set to true but the text file is empty.")          
+      }
+             
+      if(stripHeader && stripTrailer){
+        var trailer = sc.parallelize(Array(fileContents.mapPartitions { iterator =>
+          if (iterator.isEmpty) {
+            iterator
+          } else {
+            Iterator
+              .continually((iterator.next(), iterator.hasNext))
+              .collect { case (value, false) => value }
+              .take(1)
+          }
+        }.collect().last))
+        val trailerDelimiter = {
+          if (dataFrameEnvelope.hasAttribute(step + ".trailerDelimiter")) {
+            dataFrameEnvelope.getAttribute(step + ".trailerDelimiter")
+          } else {
+            dataFrameEnvelope.getAttribute(step + ".delimiter")
+          }
+        }
+        tail = trailer.first.split(trailerDelimiter)
+        strippedData = DataIntegrityUtil.stripHeaderTrailer(sc,fileContents,fileContents.first(),trailer.collect()(0))
+      }
+
+
+      if(strippedData.count == 0)
+        {val emptyRDD = strippedData.map(r => Row.fromSeq(r))
+          sourceDF = hiveContext.createDataFrame(emptyRDD,schema)
+        }
+      else
+         sourceDF = SchemaOperationsUtil.convertRddToDataFrame(strippedData.toJavaRDD(), schema, hiveContext, dataFrameEnvelope.getAttribute(step + ".delimiter"), dataFrameEnvelope.getAttribute(step + ".convertToNull"))
+
+      if(doCount && stripHeader && stripTrailer){
+        val countIndex= diCheckMap("COUNT").get(0).split(",")(1).toInt
+        
+        if((!tail(countIndex-1).trim.toInt.isValidInt) || (tail(countIndex-1).trim.isEmpty())){
+          logger.error(PRINT_FROMATTER + "Trailer Count is Null or Invalid Integer value.")
+          throw new Exception("Trailer Count is Null or Invalid Integer value.")
+        }else{
+          val trailerCount = tail(countIndex-1).trim.toInt
+          val countOffset : Int = {
+            if (dataFrameEnvelope.hasAttribute(step + ".countOffset")) {
+              dataFrameEnvelope.getAttribute(step + ".countOffset").trim.toInt
+            } else {
+              0
+            }
+          }
+          val hdrTrlrCount : Int = {
+            if (dataFrameEnvelope.getAttribute(step + ".hasHeaderTrailer") == "true") {
+              2
+            } else {
+              0
+            }
+          }
+          countStatus = DataIntegrityUtil.performCountValidation(strippedData, trailerCount, countOffset, hdrTrlrCount, dataFrameEnvelope, step)
+          if(countStatus) {
+            logger.info(PRINT_FROMATTER + 
+                "File record count matches with trailer count + offset. File count is " + dataFrameEnvelope.getAttribute(step + ".dataIntegrity.fileCount") + " , trailer count is " +
+                dataFrameEnvelope.getAttribute(step + ".dataIntegrity.trailerCount") + " and offset is " + dataFrameEnvelope.getAttribute(step + ".dataIntegrity.countOffset"))
+          }
+        }
+      }
+      
+      if(doDateCheck && stripHeader && stripTrailer){
+        val headerDateIndex= diCheckMap("DATE").get(0).split(",")(1).toInt
+        val headerDelimiter = {
+          if (dataFrameEnvelope.hasAttribute(step + ".headerDelimiter")) {
+            dataFrameEnvelope.getAttribute(step + ".headerDelimiter")
+          } else {
+            dataFrameEnvelope.getAttribute(step + ".delimiter")
+          }
+        }
+        val runtimeDate = dataFrameEnvelope.getAttribute(step + ".headerDate")
+        dateStatus = DataIntegrityUtil.performHeaderDateValidation(sc.parallelize(fileContents.take(1)), headerDateIndex-1, headerDelimiter, runtimeDate, dataFrameEnvelope, step)
+        if(dateStatus) {
+          logger.info(PRINT_FROMATTER +
+              "Header record date matches with input runtime headerDate. Header record date is " + dataFrameEnvelope.getAttribute(step + ".dataIntegrity.fileHeaderDate") + 
+              " and input header date is " + dataFrameEnvelope.getAttribute(step + ".dataIntegrity.runtimeDate"))
+        }
+      }
+      
+      if(doSum && stripHeader && stripTrailer) {
+        val sumDICheckStr : String = diCheckMap("SUM").get(0)
+        
+        if(!sumDICheckStr.matches("SUM\\,\\d+\\,[a-zA-Z0-9_]+(\\,PRECISION\\(\\d+\\,\\d+\\))?")) {
+          throw new Exception("SUM check format is invalid. It should be specified in the following format: SUM,<trailerSumIndex>,<sumCheckColName>[,PRECISION(<precision>, <scale>)]>")
+        }
+        
+        val sumDICheckStrArray : Array[String] = sumDICheckStr.split(",")
+        val trailerSumIndex : Int = sumDICheckStrArray(1).trim.toInt - 1
+        val trailerSum : Decimal = Decimal.apply(tail(trailerSumIndex).trim)
+
+        sumStatus = DataIntegrityUtil.performSumValidation(sourceDF, trailerSum, sumDICheckStr, hiveContext, dataFrameEnvelope, step)
+        if(sumStatus) {
+          logger.info(PRINT_FROMATTER + "Trailer sum check passed. Column " + dataFrameEnvelope.getAttribute(step + ".dataIntegrity.sumCheckCol") + " sum is " + 
+              dataFrameEnvelope.getAttribute(step + ".dataIntegrity.fileSum") +  " and trailer sum is " + dataFrameEnvelope.getAttribute(step + ".dataIntegrity.trailerSum"))
+        }
+      }
+          
+      if(!(countStatus && dateStatus && sumStatus)){
+        status = false
+      }
+        
+      (status, sourceDF)
+     }catch{
+       case e: Exception => logger.error(PRINT_FROMATTER + "Error occured while performing DI checks on given file."+ e)
+       throw e 
+     }
+  }
+  
+  override def validate(flowEnvelope: FlowEnvelope, step: String): Boolean = {
+    logger.info("Verifying " + step)
+    var confGood = super.validate(flowEnvelope: FlowEnvelope, step: String)
+
+    for (attribute <- Set("delimiter")){
+      if (!flowEnvelope.hasAttribute(step + "." + attribute)) {
+        logger.error(step + " is missing attribute " + attribute + ", which is required for action GetTextFile")
+        confGood = false
+      }
+    }
+    
+    if(flowEnvelope.hasAttribute(step + ".hasHeaderTrailer")) {
+      if(!(Set("true", "false") contains flowEnvelope.getAttribute(step + ".hasHeaderTrailer"))) {
+        logger.error(step + " contains invalid hasHeaderTrailer attribute value = " + flowEnvelope.getAttribute(step + ".hasHeaderTrailer") + " Expected either one of the following values: true, false")
+        confGood = false
+      }
+     }    
+    
+    if(flowEnvelope.getAttribute(step + ".hasHeaderTrailer") == "true") {
+     if (!flowEnvelope.hasAttribute(step + ".headerDate")) {
+      logger.error(PRINT_FROMATTER+step + " is missing attribute headerDate")
+      confGood = false
+      }
+    }
+
+    confGood
+  }
+
+}
+
+
+
+
