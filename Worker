@@ -1,0 +1,286 @@
+package com.bac.rctt.apps.flowbot.util
+
+import java.util.Properties
+
+import akka.actor.Actor
+import akka.util.Timeout
+import com.bac.ecr.hdf.components.keygenerator.driver.KeyGenerator
+import com.bac.ecr.hdf.frameworks.logging.HadoopLogger.DDI_LAYER
+import com.bac.ecr.hdf.frameworks.logging.{HadoopLogFactory, HadoopLogger}
+import com.bac.rctt.apps.flowbot.envelope._
+import org.apache.log4j.Logger
+import org.apache.spark.api.java.JavaSparkContext
+import org.apache.spark.sql.{DataFrame, Row}
+import org.apache.spark.sql.hive.HiveContext
+import util.SchemaUtil
+import scala.collection.immutable.HashMap
+
+/**
+ *
+ * This code is used to fetch the sqlLiteral or sqlFile from configuration file
+ * and execute those HQL's and return the dataframeEnvelope.
+ *
+ *   Date             Developer                         Change
+ * ========= ========================== ==============================================
+ * 16-Aug-17			Joe Trite								Initial Version
+ * 17-Aug-17			Sundarrajan Raman				1) Integrated with HDPF Sequence Generator's pipeline method with option
+ *                                       	2) Removed policy file check.
+ *                                       	3) Added Sum Check for RDBMS Sourcing
+ *                                       	4) Added Precision in Sum Check
+ *                                       	5) Added Hadoop Credential API for passsword encryption
+ * 12-Sep-17			Vemuri,PhaniKumar				Implemented parallelism for exports/Imports to Database
+ * 12-Sep-17			Ramamurthy Pavan. N			Made changes to accomodate multiple partition columns in CREATE TABLE statement
+ * 28-Sep-17			Ramamurthy Pavan. N			Replaced calls to envelope.getAttribute(step + ".maxConnectionsPerTable") with numConnections
+ * 02-Oct-17      C.Respass               Changed data type of datasetRowCount & queryRowCount, organized imports
+ */
+class Worker(val numConnections: Int) extends Actor {
+  val logger: Logger = Logger.getLogger(getClass.getName)
+
+  object Status extends Enumeration {
+    type Status = Value
+    val FAIL = Value("failure")
+    val PASS = Value("success")
+
+  }
+
+  implicit val timeout = Timeout(25)
+  def receive = {
+
+    case message: ActorMessage => {
+      logger.info(Thread.currentThread().toString() + "  Running for table/query " + message.flowEnvelope.getAttribute(message.step + ".table") + " with connections " + this.numConnections.toString)
+      try {
+
+        if (message.flowEnvelope.getAttribute(message.step + ".isPartitioned") == "true") {
+          message.flowEnvelope.mergeAttributes(getRdbmsByPartition(message.hiveContext, message.flowEnvelope, message.step).getAttributes())
+        } else {
+          message.flowEnvelope.mergeAttributes(getRDBMS(message.hiveContext, message.flowEnvelope, message.step).getAttributes())
+        }
+        //SEI-1171 Commenting Policy dependencies
+        //message.flowEnvelope.checkQuality(message.step)
+        message.flowEnvelope.setAttribute(message.step + ".status", Status.PASS.toString())
+        sender() ! SuccessInfo(message.flowEnvelope, message.step, 0)
+      } catch {
+        case e: Exception => {
+          logger.error("Failed importing the data for table/query " + message.flowEnvelope.getAttribute(message.step + ".table") + "\n" + e.printStackTrace())
+          message.flowEnvelope.setAttribute(message.step + ".status", Status.FAIL.toString())
+          message.flowEnvelope.setAttribute("flow.status", Status.FAIL.toString())
+          message.flowEnvelope.setAttribute("flow.status.message", e.getMessage())
+          sender() ! SuccessInfo(message.flowEnvelope, message.step, 1)
+        }
+      } finally {
+        message.counter.add(1)
+      }
+
+    }
+
+    case message: ActorMessageForWrite => {
+      logger.info(Thread.currentThread().toString() + "  Running for table/query " + message.flowEnvelope.getAttribute(message.step + ".table") + " with connections " + this.numConnections.toString)
+      try {
+
+        message.flowEnvelope.mergeAttributes(putRdbmsByPartition(message.hiveContext, message.flowEnvelope, message.step).getAttributes())
+        message.flowEnvelope.setAttribute(message.step + ".status", Status.PASS.toString())
+        sender() ! SuccessInfoForWrite(message.flowEnvelope, message.step, 0)
+      } catch {
+        case e: Exception => {
+          logger.error("Failed Exporting the data for table/query " + message.flowEnvelope.getAttribute(message.step + ".table") + "\n" + e.printStackTrace())
+          message.flowEnvelope.setAttribute(message.step + ".status", Status.FAIL.toString())
+          message.flowEnvelope.setAttribute("flow.status", Status.FAIL.toString())
+          message.flowEnvelope.setAttribute("flow.status.message", e.getMessage())
+          sender() ! SuccessInfoForWrite(message.flowEnvelope, message.step, 1)
+        }
+      } finally {
+        message.counter.add(1)
+      }
+
+    }
+
+  }
+
+  def getRDBMS(hiveContext: org.apache.spark.sql.hive.HiveContext, flowEnvelope: FlowEnvelope, step: String): DataFrameEnvelope = {
+    logger.info("Running getRdbmsTable")
+
+    val envelope = new DataFrameEnvelope(step)
+    envelope.setAttribute(step + "-function-uuid", "b44b3f39-97d8-4a78-af46-10b1af311782")
+    envelope.mergeAttributes(flowEnvelope.getAttributes())
+
+    //Using Hadoop Credential API
+    val decryptedPassword = new EncryptionUtil().decryptPassword(envelope, step)
+    var queryRowCount: Long = 0L
+    var datasetRowCount: Long = 0L
+
+    val map = HashMap( ("string" , (a:Row, b:Int)=>{ a.getString(b)} ),
+      ("integer", (a:Row,b:Int)=>{ a.getInt(b)} ),
+      ("long", (a:Row,b:Int)=>{ a.getLong(b)} )
+    )
+    var aux: Row = null
+    envelope.getAttribute(step + ".dbtype").toLowerCase match {
+      case "teradata" => {
+        envelope.setDataFrame(hiveContext.read.format("jdbc").option("url", "jdbc:" + envelope.getAttribute(step + ".dbtype") + "://" + envelope.getAttribute(step + ".hostname")).option("driver", envelope.getAttribute(step + ".driver")).option("dbtable", envelope.getAttribute(step + ".table")).option("user", envelope.getAttribute(step + ".username")).option("password", decryptedPassword).option("fetchsize", "200").load())
+        aux = hiveContext.read.format("jdbc").option("url", "jdbc:" + envelope.getAttribute(step + ".dbtype") + "://" + envelope.getAttribute(step + ".hostname")).option("driver", envelope.getAttribute(step + ".driver")).option("dbtable", envelope.getAttribute(step + ".integrityCheckQuery")).option("user", envelope.getAttribute(step + ".username")).option("password", decryptedPassword).load().select("CNT").first
+      }
+      case "sqlserver" => {
+        envelope.setDataFrame(hiveContext.read.format("jdbc").option("url", "jdbc:" + envelope.getAttribute(step + ".dbtype") + "://" + envelope.getAttribute(step + ".hostname") + ":" + envelope.getAttribute(step + ".port")).option("driver", envelope.getAttribute(step + ".driver")).option("dbtable", envelope.getAttribute(step + ".table")).option("user", envelope.getAttribute(step + ".username")).option("password", decryptedPassword).option("fetchsize", "200").load())
+        aux = hiveContext.read.format("jdbc").option("url", "jdbc:" + envelope.getAttribute(step + ".dbtype") + "://" + envelope.getAttribute(step + ".hostname") + ":" + envelope.getAttribute(step + ".port")).option("driver", envelope.getAttribute(step + ".driver")).option("dbtable", envelope.getAttribute(step + ".integrityCheckQuery")).option("user", envelope.getAttribute(step + ".username")).option("password", decryptedPassword).load().select("cnt").first
+      }
+      case _ => {
+        envelope.setDataFrame(hiveContext.read.format("jdbc").option("url", "jdbc:" + envelope.getAttribute(step + ".dbtype") + "://" + envelope.getAttribute(step + ".hostname") + ":" + envelope.getAttribute(step + ".port") + "/" + envelope.getAttribute(step + ".database")).option("driver", envelope.getAttribute(step + ".driver")).option("dbtable", envelope.getAttribute(step + ".table")).option("user", envelope.getAttribute(step + ".username")).option("password", decryptedPassword).option("fetchsize", "200").load())
+        aux = hiveContext.read.format("jdbc").option("url", "jdbc:" + envelope.getAttribute(step + ".dbtype") + "://" + envelope.getAttribute(step + ".hostname") + ":" + envelope.getAttribute(step + ".port") + "/" + envelope.getAttribute(step + ".database")).option("driver", envelope.getAttribute(step + ".driver")).option("dbtable", envelope.getAttribute(step + ".integrityCheckQuery")).option("user", envelope.getAttribute(step + ".username")).option("password", decryptedPassword).load().select("CNT").first
+      }
+    }
+    val value = map(aux.schema.fields(0).dataType.typeName) (aux,0)
+    queryRowCount = value.asInstanceOf[Number].longValue
+    datasetRowCount = checkCountValidation(step, envelope, queryRowCount, datasetRowCount)
+    if (envelope.hasAttribute(step + ".sumCheckQuery")){      
+        new RDBMSSumCheckUtil().checkSumValidation(hiveContext, step, envelope)
+      }
+
+    if (envelope.getAttribute(step + ".applySequenceGenerator") == "true") {
+      applySequenceGenertor(hiveContext, envelope, step)
+    }
+     checkAutoSave(step, envelope, hiveContext, datasetRowCount)
+    envelope
+  }
+
+  def getRdbmsByPartition(hiveContext: org.apache.spark.sql.hive.HiveContext, flowEnvelope: FlowEnvelope, step: String): DataFrameEnvelope = {
+    logger.info("Running getRdbmsByPartition")
+
+    val envelope = new DataFrameEnvelope(step)
+    envelope.setAttribute(step + "-function-uuid", "b44b3f39-97d8-4a78-af46-10b1af311782")
+    envelope.mergeAttributes(flowEnvelope.getAttributes())
+
+    val decryptedPassword = new EncryptionUtil().decryptPassword(envelope, step)
+
+    var queryRowCount: Long = 0L
+    var datasetRowCount: Long = 0L
+    val map = HashMap( ("string" , (a:Row, b:Int)=>{ a.getString(b)} ),
+      ("integer", (a:Row,b:Int)=>{ a.getInt(b)} ),
+      ("long", (a:Row,b:Int)=>{ a.getLong(b)} )
+    )
+    var aux: Row = null
+
+    envelope.getAttribute(step + ".dbtype").toLowerCase match {
+      case "teradata" => {
+        envelope.setDataFrame(hiveContext.read.format("jdbc").option("url", "jdbc:" + envelope.getAttribute(step + ".dbtype") + "://" + envelope.getAttribute(step + ".hostname")).option("driver", envelope.getAttribute(step + ".driver")).option("dbtable", envelope.getAttribute(step + ".table")).option("user", envelope.getAttribute(step + ".username")).option("password", decryptedPassword).option("partitionColumn", envelope.getAttribute(step + ".partitionColumn")).option("lowerBound", envelope.getAttribute(step + ".lowerBound")).option("upperBound", envelope.getAttribute(step + ".upperBound")).option("numPartitions", this.numConnections.toString).option("fetchsize", "200").load())
+        aux = hiveContext.read.format("jdbc").option("url", "jdbc:" + envelope.getAttribute(step + ".dbtype") + "://" + envelope.getAttribute(step + ".hostname")).option("driver", envelope.getAttribute(step + ".driver")).option("dbtable", envelope.getAttribute(step + ".integrityCheckQuery")).option("user", envelope.getAttribute(step + ".username")).option("password", decryptedPassword).load().select("CNT").first
+      }
+      case "sqlserver" => {
+        envelope.setDataFrame(hiveContext.read.format("jdbc").option("url", "jdbc:" + envelope.getAttribute(step + ".dbtype") + "://" + envelope.getAttribute(step + ".hostname") + ":" + envelope.getAttribute(step + ".port")).option("driver", envelope.getAttribute(step + ".driver")).option("dbtable", envelope.getAttribute(step + ".table")).option("user", envelope.getAttribute(step + ".username")).option("password", decryptedPassword).option("partitionColumn", envelope.getAttribute(step + ".partitionColumn")).option("lowerBound", envelope.getAttribute(step + ".lowerBound")).option("upperBound", envelope.getAttribute(step + ".upperBound")).option("numPartitions", this.numConnections.toString).option("fetchsize", "200").load())
+        aux = hiveContext.read.format("jdbc").option("url", "jdbc:" + envelope.getAttribute(step + ".dbtype") + "://" + envelope.getAttribute(step + ".hostname") + ":" + envelope.getAttribute(step + ".port")).option("driver", envelope.getAttribute(step + ".driver")).option("dbtable", envelope.getAttribute(step + ".integrityCheckQuery")).option("user", envelope.getAttribute(step + ".username")).option("password", decryptedPassword).load().select("cnt").first
+      }
+      case _ => {
+        envelope.setDataFrame(hiveContext.read.format("jdbc").option("url", "jdbc:" + envelope.getAttribute(step + ".dbtype") + "://" + envelope.getAttribute(step + ".hostname") + ":" + envelope.getAttribute(step + ".port") + "/" + envelope.getAttribute(step + ".database")).option("driver", envelope.getAttribute(step + ".driver")).option("dbtable", envelope.getAttribute(step + ".table")).option("user", envelope.getAttribute(step + ".username")).option("password", decryptedPassword).option("partitionColumn", envelope.getAttribute(step + ".partitionColumn")).option("lowerBound", envelope.getAttribute(step + ".lowerBound")).option("upperBound", envelope.getAttribute(step + ".upperBound")).option("numPartitions", this.numConnections.toString).option("fetchsize", "200").load())
+        aux = hiveContext.read.format("jdbc").option("url", "jdbc:" + envelope.getAttribute(step + ".dbtype") + "://" + envelope.getAttribute(step + ".hostname") + ":" + envelope.getAttribute(step + ".port") + "/" + envelope.getAttribute(step + ".database")).option("driver", envelope.getAttribute(step + ".driver")).option("dbtable", envelope.getAttribute(step + ".integrityCheckQuery")).option("user", envelope.getAttribute(step + ".username")).option("password", decryptedPassword).load().select("CNT").first
+      }
+    }
+
+    val value = map(aux.schema.fields(0).dataType.typeName) (aux,0)
+    queryRowCount = value.asInstanceOf[Number].longValue
+    datasetRowCount = checkCountValidation(step, envelope, queryRowCount, datasetRowCount)
+    if (envelope.hasAttribute(step + ".sumCheckQuery")){
+        new RDBMSSumCheckUtil().checkSumValidation(hiveContext, step, envelope)
+     }
+        
+    if (envelope.getAttribute(step + ".applySequenceGenerator") == "true") {
+      applySequenceGenertor(hiveContext, envelope, step)
+    }
+    
+    checkAutoSave(step, envelope, hiveContext, datasetRowCount)
+
+    envelope
+  }
+
+  def applySequenceGenertor(hiveContext: org.apache.spark.sql.hive.HiveContext, envelope: com.bac.rctt.apps.flowbot.envelope.DataFrameEnvelope, step: String) = {
+     logger.info("Running Sequence Number Generator")
+     logger.info("Dataset Name is: " + envelope.getAttribute(step + ".name"))
+    val jsc = JavaSparkContext.fromSparkContext(hiveContext.sparkContext)
+    val hadoopLogger: HadoopLogger = HadoopLogFactory.getInstance(getClass().getSimpleName(), DDI_LAYER.TRANSFORMATION, jsc.applicationId, jsc.hadoopConfiguration());
+    //val hadoopLogger: HadoopLogger = new DummyHadoopLogger
+    val dFwithKeys: DataFrame = KeyGenerator.generateSeqNum(envelope.getDataFrame(), envelope.getAttribute(step + ".seqColName").trim(), envelope.getAttribute(step + ".dataType").trim(), jsc, hiveContext, hadoopLogger)
+    envelope.setDataFrame(dFwithKeys)
+    logger.info("Dataset with Sequence Number Name is: " + envelope.getAttribute(step + ".name"))
+  }
+
+  def checkCountValidation(step: String, envelope: DataFrameEnvelope, queryRowCount: Long, datasetRowCount: Long): Long = {
+    var returnValue: Long = datasetRowCount
+    if (envelope.getAttribute(step + ".validateCounts") == "true") {
+      logger.info("Running Count Validation")
+
+      returnValue = envelope.getDataFrame().count()
+
+      envelope.setAttribute(step + ".dataIntegrity.datasetRowCount", returnValue.toString)
+      envelope.setAttribute(step + ".dataIntegrity.queryRowCount", queryRowCount.toString)
+      envelope.setAttribute(step + ".dataIntegrity.countCheckStatus", "pass")
+
+      if (returnValue != queryRowCount) {
+        envelope.setAttribute(step + ".dataIntegrity.countCheckStatus", "fail")
+      }
+    }
+
+    returnValue
+  }
+
+  def checkAutoSave(step: String, envelope: DataFrameEnvelope, hiveContext: HiveContext, rowCount: Long): Unit = {
+    if (envelope.hasAttribute(step + ".autoSavePath")) {
+      logger.info("Running AutoSave")
+      if (envelope.hasAttribute(step + ".autoSavePartition")) {
+        logger.info("Found AutoSave Partition")
+        envelope.getDataFrame().coalesce(envelope.getOrDefault(step + ".autoSaveOutputCoalesce", "1").toInt).write.format(envelope.getAttribute(step + ".autoSaveFormat")).mode(envelope.getAttribute(step + ".autoSaveSaveMode")).partitionBy(envelope.getAttribute(step + ".autoSavePartition").replaceAll("\\s","").split(",") : _*).save(envelope.getAttribute(step + ".autoSavePath") + "/" + envelope.getAttribute(step + ".name"))
+      } else {
+        envelope.getDataFrame().coalesce( envelope.getOrDefault(step + ".autoSaveOutputCoalesce", "1").toInt).write.format(envelope.getAttribute(step + ".autoSaveFormat")).mode(envelope.getAttribute(step + ".autoSaveSaveMode")).save(envelope.getAttribute(step + ".autoSavePath") + "/" + envelope.getAttribute(step + ".name"))
+      }  }  
+
+    if (envelope.getAttribute(step + ".autoSaveRefreshHiveTable") == "true") {
+      logger.info("Running autoSaveRefreshHiveTable")
+      val hive_drop_table = SchemaUtil.getHiveDropTableStatement(envelope.getAttribute(step + ".autoSaveRefreshHiveTableDatabaseName"), envelope.getAttribute(step + ".name"))
+
+      val hive_create_table = if (envelope.hasAttribute(step + ".autoSavePartition")) {
+        SchemaUtil.getCreateHiveTableWithPartitionsStatement(envelope.getDataFrame().schema, envelope.getAttribute(step + ".autoSaveRefreshHiveTableDatabaseName"),envelope.getAttribute(step + ".name"), envelope.getAttribute(step + ".autoSaveFormat"), envelope.getAttribute(step + ".autoSavePartition").replaceAll("\\s",""),  envelope.getAttribute(step + ".autoSavePath") + "/" + envelope.getAttribute(step + ".name"), rowCount.toString)
+      } else {
+        SchemaUtil.getCreateHiveTableStatement(envelope.getDataFrame().schema, envelope.getAttribute(step + ".autoSaveRefreshHiveTableDatabaseName"), envelope.getAttribute(step + ".name"), envelope.getAttribute(step + ".autoSaveFormat"), envelope.getAttribute(step + ".autoSavePath") + "/" + envelope.getAttribute(step + ".name"), rowCount.toString)
+      }
+
+      val hive_repair_table = SchemaUtil.getRepairHiveTableStatement(envelope.getAttribute(step + ".autoSaveRefreshHiveTableDatabaseName"), envelope.getAttribute(step + ".name"))
+
+      logger.info("drop table statement to execute: " + hive_drop_table)
+      hiveContext.sql(hive_drop_table)
+      logger.info("create table statement to execute: " + hive_create_table)
+      hiveContext.sql(hive_create_table)
+      logger.info("repair table statement to execute: " + hive_repair_table)
+      hiveContext.sql(hive_repair_table)
+      logger.info("autoSaveRefreshHiveTable complete")
+    }
+
+    logger.info("checkAutoSave complete")
+
+  }
+
+  def putRdbmsByPartition(hiveContext: org.apache.spark.sql.hive.HiveContext, flowEnvelope: FlowEnvelope, step: String): DataFrameEnvelope = {
+    logger.info("Running putTempTabletoRdbms")
+    if (!flowEnvelope.hasAttribute(step + ".saveMode") || !flowEnvelope.hasAttribute(step + ".jdbcUrl") || !flowEnvelope.hasAttribute(step + ".table")) {
+      throw new Exception("putTempTableToRDBMS is missing attributes.  Expecting saveMode,jdbcUrl,table!")
+    } else {
+      logger.info("saveMode: " + flowEnvelope.getAttribute(step + ".saveMode"))
+      logger.info("table: " + flowEnvelope.getAttribute(step + ".table"))
+      logger.info("jdbcUrl: " + flowEnvelope.getAttribute(step + ".jdbcUrl"))
+    }
+
+    val envelope: DataFrameEnvelope = new DataFrameEnvelope(step)
+    envelope.setAttribute(step + ".function-uuid", "f1720382-317a-4e4d-b0c3-be878b462786")
+    //envelope.mergeAttributesWithFilter(flowEnvelope.getAttributes(), step)
+    envelope.mergeAttributes(flowEnvelope.getAttributes())
+    logger.info("Sql Query to Execute:" + "select * from " + envelope.getAttribute(step + ".name"))
+    envelope.setDataFrame(hiveContext.sql("select * from " + envelope.getAttribute(step + ".name")))
+
+    val decryptedPassword = new EncryptionUtil().decryptPassword(envelope, step)
+
+    val properties = new Properties()
+    properties.put("user", envelope.getAttribute(step + ".username"))
+    properties.put("password", decryptedPassword)
+    properties.put("driver", envelope.getAttribute(step + ".driver"))
+    var writeDf = envelope.getDataFrame()
+    writeDf = { if (writeDf.rdd.getNumPartitions > this.numConnections) writeDf.coalesce(this.numConnections) else writeDf }
+    writeDf.write.mode(envelope.getAttribute(step + ".saveMode")).jdbc(envelope.getAttribute(step + ".jdbcUrl"), envelope.getAttribute(step + ".table"), properties)
+    envelope
+  }
+
+}
