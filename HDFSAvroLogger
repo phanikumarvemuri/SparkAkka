@@ -1,0 +1,178 @@
+
+package logging;
+
+import java.io.IOException;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+
+import org.apache.avro.Schema;
+import org.apache.avro.file.DataFileWriter;
+import org.apache.avro.generic.GenericData;
+import org.apache.avro.generic.GenericDatumWriter;
+import org.apache.avro.generic.GenericRecord;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+import org.apache.log4j.Logger;
+
+/**
+ * Alpide's HDFS logger class that will be responsible for writing log messages into
+ * HDFS directory in avro format.
+ * This logger would be per JVM specific to a name. The name would be provided by the client, that could be identified as 
+ * seperable components/Stages. 
+ * Log File: Log file will be chosen as a per component's run.
+ * @author 
+ *
+ */
+
+public class HDFSAvroLogger extends  AbstractHadoopLogger {
+	
+	private static final long serialVersionUID = -3346794709755499204L;
+
+	private static final Logger log4jLogger = Logger.getLogger(HDFSAvroLogger.class);
+
+	private static final String AVRO_EXTN = ".avro";
+	private static SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SS");
+	private static DataFileWriter<GenericRecord> dataFileWriter = new DataFileWriter<GenericRecord>(new GenericDatumWriter<GenericRecord>());
+	private Schema logSchema;
+	
+	HDFSAvroLogger(String parent, String anApplication, 
+			String aName, String aProduct, 
+			String aStage, String aLogSchema,
+			String aLogLevel,String aControlPoint,
+			boolean aLogLineageMessage ,
+			Configuration aConf) throws IOException {		
+super(parent,anApplication,
+		aName,aProduct,
+		aStage,aLogSchema,
+		aLogLevel, aControlPoint,
+		aLogLineageMessage,aConf);
+log4jLogger.info("HDFS Logger Conf Passed: " + aConf);
+}
+	
+	HDFSAvroLogger(String parent, String anApplication, 
+					String aName, String aProduct, 
+					String aStage, String aLogSchema,
+					String aLogLevel,String aControlPoint,
+					boolean aLogLineageMessage, String runId ,
+					Configuration aConf) throws IOException {		
+		super(parent,anApplication,
+				aName,aProduct,
+				aStage,aLogSchema,
+				aLogLevel, aControlPoint,
+				aLogLineageMessage, runId, 
+				aConf);
+		
+		
+		log4jLogger.info("HDFS Logger Conf Passed: " + aConf);
+	}
+	
+	/**
+	 * Initializing the Logger so that 1) the Log File is created or opened
+	 * TODO To Lazily create the Log file only after the client tries to do a First Write using Log Method.
+	 * @param conf
+	 * @throws IOException
+	 */
+	
+	protected  synchronized void initialize() throws IOException {
+		
+		if (isInitialized()) return;
+		log4jLogger.info("Initialising Hadoop Logger for the log file...");
+		if (logSchema == null){
+			loadLogSchema(getSchemaPath(), getConfig());
+		}
+		
+		dataFileWriter = new DataFileWriter<GenericRecord>(new GenericDatumWriter<GenericRecord>(logSchema));		
+		SeekableInputStream input = null;
+		if (getFileName().getFileSystem(getConfig()).exists(getFileName())){
+			input = new SeekableInputStream(getFileName(), getConfig());
+			dataFileWriter.appendTo(input, getFileName().getFileSystem(getConfig()).append(getFileName()));			 
+		 }else{			 			 			
+			 dataFileWriter.create(logSchema, getFileName().getFileSystem(getConfig()).create(getFileName()));
+			 dataFileWriter.flush();
+			 dataFileWriter.close();
+			 input = new SeekableInputStream(getFileName(), getConfig());
+			 dataFileWriter.appendTo(input, getFileName().getFileSystem(getConfig()).append(getFileName()));			 
+		 }
+		markInitialized();
+	}
+	
+	/**
+	 * Method for appending into the same file. Commenting this method so that it can used later for any research on this.
+	 * @param parent
+	 * @param name
+	 * @param conf
+	 * @return
+	 * @throws IOException
+	 */
+	/*private Path getComponentLogPath(String parent,String name,Configuration conf) throws IOException {
+		log4jLogger("Parent: " + parent + " File Name : " + name);
+		String fileName = name + "_" + "LOG.avro";
+		Path avroPath = new Path(parent, fileName);
+		log4jLogger(avroPath.getFileSystem(conf));
+		return avroPath;		
+	}*/
+	
+	
+	protected void buildDatumAndLog(String application, String product, 
+									HADOOPLOGTYPE messageType, String stage, 
+									String subStage, String fileTableName, 
+									String sourceName, String controlPoint,
+									String runId, String message){		
+		GenericRecord datum = new GenericData.Record(logSchema);
+		datum.put("product", product);
+		datum.put("application", application);
+		datum.put("messagetype", messageType.toString());
+		datum.put("stage", stage);
+		datum.put("substage", subStage);
+		datum.put("sourcename", sourceName);
+		datum.put("controlpoint",controlPoint );
+		datum.put("file_or_tbl_name", fileTableName == null ? "" : fileTableName);
+		datum.put("message", message);
+		if(null!=runId)datum.put("runid", runId);
+		datum.put("timestamp",sdf.format(new Date()));
+		logMessage(datum);
+	}
+	
+	private synchronized void  logMessage(GenericRecord record){				
+		try{			
+			dataFileWriter.append(record);					
+			dataFileWriter.flush();
+		}catch(Exception e){			
+			e.printStackTrace();
+		}
+		
+	}
+
+	
+	/**
+	 * Load the Log Schema from the Schema path provided from properties file.
+	 * @param schemaFileName
+	 * @param conf
+	 */
+	private void loadLogSchema(String schemaFileName,Configuration conf){					
+		Schema.Parser myParser = new Schema.Parser();
+		try{
+			Path schemaPath = new Path(schemaFileName);
+			logSchema = myParser.parse(schemaPath.getFileSystem(conf).open(schemaPath));			
+		}catch(Exception e){
+			e.printStackTrace();
+		}		
+	}
+	
+	protected String getLogFileExtension(){
+		return AVRO_EXTN;
+	}
+	
+	@Override
+	public void close()  {
+		try{
+			//Need to close the Writer in any means
+			log4jLogger.info("Closing Hadoop Logger");
+			dataFileWriter.close();
+			unInitialize();
+		}catch(Exception ignored){//Any exception in close ignore it
+			ignored.printStackTrace();
+		}			
+	}
+	
+}
