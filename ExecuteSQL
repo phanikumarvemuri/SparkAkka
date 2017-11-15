@@ -1,0 +1,123 @@
+package flowbot.processors
+ 
+import com.bac.rctt.apps.flowbot.envelope.{DataFrameEnvelope, FlowEnvelope}
+import org.apache.spark.SparkContext
+import org.apache.spark.api.java.JavaSparkContext
+import com.bac.ecr.hdf.components.utils.commonutils.{ HdfsUtils, CommonUtils }
+import com.bac.ecr.hdf.frameworks.logging.{ HadoopLogFactory, HadoopLogger }
+import com.bac.ecr.hdf.frameworks.logging.HadoopLogger.DDI_LAYER
+import com.bac.ecr.hdf.components.keygenerator.driver.KeyGenerator
+import org.apache.spark.sql.DataFrame
+
+
+
+
+class ExecuteSQL()  extends BaseProcessor {
+  
+  val PRINT_FROMATTER="******************"
+  def run(sc: SparkContext, hiveContext: org.apache.spark.sql.hive.HiveContext, flowEnvelope: FlowEnvelope, step: String): FlowEnvelope = {
+
+    var sqlQuery: String = {
+      if (flowEnvelope.hasAttribute(step + ".sqlLiteral")) {
+        flowEnvelope.getAttribute(step + ".sqlLiteral")
+      } else {
+        hdfsFileAsString(flowEnvelope.getAttribute(step + ".sqlFile"), flowEnvelope)
+      }
+    }
+
+    var subStepNumber = 1
+    
+    sqlQuery.trim().split(";").foreach(query => {
+      logger.info("Item to execute:" + query)
+      var newstep = step + "-" + subStepNumber
+      logger.info("New Step Name:" + newstep)
+      var sqlQuery = query.substring(0, query.lastIndexOf(" "))
+      logger.info("Query to execute:" + sqlQuery)
+      var sqlDatasetName = query.substring(query.lastIndexOf(" ") + 1, query.length())
+      logger.info("Dataset will be named:" + sqlDatasetName)
+    try{
+      flowEnvelope.cloneAttributes(step, newstep)
+
+      flowEnvelope.setAttribute(newstep + ".name", sqlDatasetName)
+      flowEnvelope.setAttribute(newstep + ".table", sqlQuery)
+      
+      
+      if(flowEnvelope.getAttribute(step + ".applySequenceGenerator").equalsIgnoreCase("TRUE")){
+        flowEnvelope.setAttribute(newstep + ".applySequenceGenerator", flowEnvelope.getAttribute(step + ".applySequenceGenerator"))
+        flowEnvelope.setAttribute(newstep + ".seqColName", flowEnvelope.getAttribute(step + ".seqColName"))
+        flowEnvelope.setAttribute(newstep + ".dataType", flowEnvelope.getAttribute(step + ".dataType"))
+      }
+    
+      logger.info("found executeSQLList step! Going to pass '" + newstep + "' to sp.executeSQL")
+
+      flowEnvelope.mergeAttributes(executeSQL(sc,hiveContext, flowEnvelope, newstep).getAttributes())
+      //flowEnvelope.checkQuality(newstep)
+
+      subStepNumber += 1
+     }catch{
+        case e: Exception => logger.error(PRINT_FROMATTER + "Error occured while running ExecuteSQL."+ e)
+        throw e
+     }
+    })
+
+    flowEnvelope
+  }
+
+  def executeSQL(sc: SparkContext,hiveContext:  org.apache.spark.sql.hive.HiveContext, flowEnvelope: FlowEnvelope, step: String): DataFrameEnvelope = {
+    logger.info(PRINT_FROMATTER+"Running ExecuteSql")
+    try{
+      val envelope = new DataFrameEnvelope(step)
+      envelope.setAttribute(step + ".function-uuid", "216c5bb0-359d-11e7-a919-92ebcb67fe33")
+      envelope.mergeAttributes(flowEnvelope.getAttributes())
+      envelope.setDataFrame(hiveContext.sql(envelope.getAttribute(step + ".table")))
+      
+      if(flowEnvelope.hasAttribute(step + ".applySequenceGenerator") && flowEnvelope.getAttribute(step + ".applySequenceGenerator").equalsIgnoreCase("TRUE")){
+      try{  
+        val jsc = JavaSparkContext.fromSparkContext(sc)
+        val hadoopLogger: HadoopLogger = HadoopLogFactory.getInstance(getClass().getSimpleName(), DDI_LAYER.TRANSFORMATION, jsc.applicationId, jsc.hadoopConfiguration());
+        val dfWithKeys: DataFrame = KeyGenerator.generateSeqNum(envelope.getDataFrame(), envelope.getAttribute(step + ".seqColName").trim(), envelope.getAttribute(step + ".dataType").trim(), jsc, hiveContext, hadoopLogger)
+        envelope.setDataFrame(dfWithKeys)
+      }catch{
+       case e: Exception => logger.error(PRINT_FROMATTER + "Error occured while running Keygenerator."+ e)
+       throw e
+      } 
+      }
+      envelope
+    }catch{
+     case e: Exception => logger.error(PRINT_FROMATTER + "Error occured while running ExecuteSQL."+ e)
+     throw e
+   } 
+  }
+
+  override def validate(flowEnvelope: FlowEnvelope, step: String): Boolean = {
+    logger.info("Verifying " + step)
+    var confGood = super.validate(flowEnvelope: FlowEnvelope, step: String)
+
+    if (!flowEnvelope.hasAttribute(step + ".sqlLiteral") && !flowEnvelope.hasAttribute(step + ".sqlFile")) {
+      logger.error(step + " is missing both sqlLiteral and sqlFile. One of the two must be defined for action executeSQL.")
+      confGood = false
+    }
+    if (flowEnvelope.hasAttribute(step + ".sqlLiteral") && flowEnvelope.hasAttribute(step + ".sqlFile")) {
+      logger.error(step + " has attribute sqlLiteral and sqlFile. Only one can be defined for action executeSQL.")
+      confGood = false
+    }
+    if (flowEnvelope.hasAttribute(step + ".table")) {
+      logger.error(step + " is missing attribute table, which is required for action executeSQL.")
+      confGood = false
+    }
+    if (!flowEnvelope.hasAttribute(step + ".applySequenceGenerator")) {
+       flowEnvelope.setAttribute(step + ".applySequenceGenerator", "false")
+    }
+    if(flowEnvelope.getAttribute(step + ".applySequenceGenerator").equalsIgnoreCase("TRUE")){
+      if (!flowEnvelope.hasAttribute(step + ".seqColName")) {
+        logger.error(step + " is missing attribute seqColName, which is required for action executeSQL.")
+        confGood = false
+      }
+      if (!flowEnvelope.hasAttribute(step + ".dataType")) {
+        logger.error(step + " is missing attribute dataType, which is required for action executeSQL.")
+        confGood = false
+      }
+    }
+    confGood
+  }
+}
