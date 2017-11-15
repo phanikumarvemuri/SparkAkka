@@ -1,0 +1,228 @@
+package flowbot.envelope
+
+import com.typesafe.config.Config
+import org.apache.log4j.Logger
+
+import scala.collection.JavaConversions._
+
+abstract class Envelope() {
+
+  private var _attributes: collection.mutable.Map[String, String] = scala.collection.mutable.Map.empty
+  val logger = Logger.getLogger(getClass.getName)
+  logger.debug("New Instance of Envelope")
+
+  def setAttributes(attributes: collection.mutable.Map[String, String]): Unit = {
+    logger.debug("setAttributes")
+    _attributes = attributes
+  }
+
+  def setAttribute(name: String, value: String): Unit = {
+    logger.debug("addAttribute")
+    logger.debug("name=" + name + " value=" + value)
+    //this.setAttributes(_attributes += (name -> value))
+    _attributes += (name -> value)
+  }
+
+  def getAttributes(): collection.mutable.Map[String, String] = {
+    logger.debug("getAttributes:" + _attributes)
+    _attributes
+  }
+
+  def getAttribute(name: String): String = {
+    logger.debug("getAttribute")
+    logger.debug("name=" + name)
+    this._attributes.getOrElse(name, "not found: " + name)
+  }
+
+  def removeAttribute(name: String): Unit = {
+    logger.debug("removeAttribute")
+    logger.debug("name=" + name)
+    this._attributes.remove(name)
+  }
+
+  def hasAttribute(name: String): Boolean = {
+    logger.debug("hasAttribute" + " name=" + name)
+    this._attributes.contains(name)
+  }
+
+  def hasAttributeLike(name: String): Boolean = {
+    logger.debug("hasAttributeLike" + " name=" + name)
+    var found = false
+    this._attributes.foreach(e => if (e._1.contains(name)) { found = true })
+    found
+  }
+
+  def hasAttributeEndingWith(name: String): Boolean = {
+    logger.debug("hasAttributeEndingWith" + " name=" + name)
+    var found = false
+    this._attributes.foreach(e => if (e._1.endsWith(name)) { found = true })
+    found
+  }
+
+  def setAttributesFromConfig(conf: Config, confStep: String): Unit = {
+    logger.debug("setAttributesFromConfig")
+    var attributes: collection.mutable.Map[String, String] = scala.collection.mutable.Map.empty
+
+    conf.getObject(confStep).foreach({
+      case (k, v) =>
+        this.setAttribute(k, v.unwrapped().toString)
+        this.setAttribute(confStep + "." + k, v.unwrapped().toString)
+        logger.debug("loading attribute key=" + k + " value=" + v.unwrapped().toString)
+    })
+  }
+
+  def mergeAttributes(attributes: collection.mutable.Map[String, String]): Unit = {
+    logger.info("Running mergeAttributes")
+    this.getAttributes ++= attributes.map {
+      case (k, v) => k -> {
+        this.getAttributes().getOrElse(k, v)
+      }
+    }
+  }
+
+
+  def cloneAttributes(valueToClone: String, newValue: String): Unit = {
+    logger.info("Running clone attributes")
+    this.getAttributes ++= this.getAttributes.map{ case (k,v) => k.replace(valueToClone + ".", newValue + "." ) -> {this.getAttributes.getOrElse(k, v)} }
+  }
+
+
+  def mergeAttributesWithFilter(attributes: collection.mutable.Map[String, String], filter: String): Unit = {
+    logger.info("Running mergeAttributesWithFilter")
+    this.getAttributes ++= attributes.filter(key => key._1.startsWith(filter))
+  }
+
+  def getAttributesWithFilter(filter: String): collection.mutable.Map[String, String] = {
+    logger.info("Running mergeAttributesWithFilter")
+    this._attributes.filter(key => key._1.contains(filter))
+  }
+
+  def getSteps(filter: String): collection.mutable.Map[String, String] = {
+    logger.info("Running getSteps")
+    this._attributes.filter(key => key._1.startsWith(filter)).map(e => (e._1.substring(0, e._1.lastIndexOf(".")), e._2))
+  }
+
+  //use this method if you have default value for the attribute
+  def getOrDefault[T](name: String, defaultValue: T): String = {
+    logger.debug("getAttribute")
+    logger.debug("name=" + name)
+    this._attributes.getOrElse(name, defaultValue.toString())
+
+  }
+
+  override def toString: String = {
+    //f low.uuid, flow.envelope.uuid, flow.name, flow.ts_flow_start, flow.ts_flow_end, key, value
+    this._attributes.map(e => "%s,%s,%s,%s,%s,%s,%s" format (this.getAttribute("flow.uuid"), this.getAttribute("flow.envelope.uuid"), this.getAttribute("flow.name"), this.getAttribute("flow.ts_flow_start"), this.getAttribute("flow.ts_flow_end"), e._1, e._2)).mkString("", "\n", "\n")
+  }
+
+  def checkQuality(step: String): Unit = {
+    logger.info("checkQuality")
+    val stepName = this.getAttribute(step + ".name")
+    // determine if this step is associated with a policy
+    if (this.hasAttribute(step + ".policy")) {
+      logger.info("policy found for step: " + step + ".policy")
+
+      val policyName = this.getAttribute(step + ".policy")
+      logger.info("policy name is: " + policyName)
+
+      val qualityPolicyName = policyName + ".quality"
+      val controlAction = this.getAttribute(policyName + ".control.failureAction")
+      val maxSumVariance: Double = this.getAttribute(qualityPolicyName + ".maxSumVariance").toDouble
+      val maxTotalCountVariance: Double = this.getAttribute(qualityPolicyName + ".maxTotalCountVariance").toDouble
+      val maxNullCountVariance: Double = this.getAttribute(qualityPolicyName + ".maxNullCountVariance").toDouble
+      val maxEmptyCountVariance: Double = this.getAttribute(qualityPolicyName + ".maxEmptyCountVariance").toDouble
+      val maxUniqueValuesCountVariance: Double = this.getAttribute(qualityPolicyName + ".maxUniqueValuesCountVariance").toDouble
+
+      val minSumVariance: Double = this.getAttribute(qualityPolicyName + ".minSumVariance").toDouble
+      val minTotalCountVariance: Double = this.getAttribute(qualityPolicyName + ".minTotalCountVariance").toDouble
+      val minNullCountVariance: Double = this.getAttribute(qualityPolicyName + ".minNullCountVariance").toDouble
+      val minEmptyCountVariance: Double = this.getAttribute(qualityPolicyName + ".minEmptyCountVariance").toDouble
+      val minUniqueValuesCountVariance: Double = this.getAttribute(qualityPolicyName + ".minUniqueValuesCountVariance").toDouble
+
+      this._attributes.filter(item => item._1.contains(stepName) && !item._1.contains("Importstatus") && !item._1.contains("dataType") && !item._1.contains("lastrun.metadata")).map(e => {
+
+        // determine if a metadata entry exists for this data item.
+        if (this.hasAttribute("lastrun.metadata." + e._1) && this.hasAttribute(e._1)) {
+          logger.info("lastrun metadata found: " + "lastrun.metadata." + e._1)
+          val previousValue: Double = this.getAttribute("lastrun.metadata." + e._1).toDouble
+          val currentValue = this.getAttribute(e._1).toDouble
+
+          var variance = ((currentValue - previousValue) / currentValue) * 100
+
+          if (variance.isNaN || variance.isInfinity) { variance = 0 }
+
+          // total unique values dq check
+          if (e._1.contains("-uniqueValues")) {
+            logger.info("checking unique values")
+            if (variance < minUniqueValuesCountVariance || variance > maxUniqueValuesCountVariance) {
+              if (controlAction.equals("logAndContinue")) {
+                this.setAttribute("alert." + qualityPolicyName + ".uniqueValuesCountVariance.failure", e._1 + " variance expected to be between " + minUniqueValuesCountVariance + " and " + maxUniqueValuesCountVariance + " but was " + variance)
+              } else {
+                throw new Exception("alert." + qualityPolicyName + ".uniqueValuesCountVariance.failure:" + e._1 + " variance expected to be between " + minUniqueValuesCountVariance + " and " + maxUniqueValuesCountVariance + " but was " + variance)
+              }
+            } else {
+              this.setAttribute(e._1 + ".uniqueValuesVariance.pass", variance.toString)
+            }
+          }
+          // total count dq check
+          if (e._1.contains("-nulls")) {
+            logger.info("checking nulls")
+            if (variance > maxNullCountVariance || variance < minNullCountVariance) {
+              if (controlAction.equals("logAndContinue")) {
+                this.setAttribute("alert." + qualityPolicyName + ".nullCountVariance.failure", e._1 + " variance expected to be between " + minNullCountVariance + " and " + maxNullCountVariance + " but was " + variance)
+              } else {
+                throw new Exception("alert." + qualityPolicyName + ".nullValuesCountVariance.failure:" + e._1 + " variance expected to be between " + minNullCountVariance + " and " + maxNullCountVariance + " but was " + variance)
+              }
+            } else {
+              this.setAttribute(e._1 + ".nullCountVariance.pass", variance.toString)
+            }
+          }
+
+          // total empties dq check
+          if (e._1.contains("-empties")) {
+            logger.info("checking empties")
+            if (variance > maxEmptyCountVariance || variance < minEmptyCountVariance) {
+              if (controlAction.equals("logAndContinue")) {
+                this.setAttribute("alert." + qualityPolicyName + ".emptyCountVariance.failure", e._1 + " variance expected to be between " + minEmptyCountVariance + " and " + maxEmptyCountVariance + " but was " + variance)
+              } else {
+                throw new Exception("alert." + qualityPolicyName + ".emptyCountVariance.failure:" + e._1 + " variance expected to be between " + minEmptyCountVariance + " and " + maxEmptyCountVariance + " but was " + variance)
+              }
+            } else {
+              this.setAttribute(e._1 + ".emptyCountVariance.pass", variance.toString)
+            }
+          }
+
+          // total count dq check
+          if (e._1.contains("-totalCount")) {
+            logger.info("checking total counts")
+            if (variance > maxTotalCountVariance || variance < minTotalCountVariance) {
+              if (controlAction.equals("logAndContinue")) {
+                this.setAttribute("alert." + qualityPolicyName + ".totalCountVariance.failure", e._1 + " variance expected to be between " + minTotalCountVariance + " and " + maxTotalCountVariance + " but was " + variance)
+              } else {
+                throw new Exception("alert." + qualityPolicyName + ".totalCountVariance.failure:" + e._1 + " variance expected to be between " + minTotalCountVariance + " and " + maxTotalCountVariance + " but was " + variance)
+              }
+            } else {
+              this.setAttribute(e._1 + ".totalCountVariance.pass", variance.toString)
+            }
+          }
+
+          // total sum dq check
+          if (e._1.contains("-sum")) {
+            logger.info("checking sums")
+            if (variance > maxSumVariance || variance < minSumVariance) {
+              if (controlAction.equals("logAndContinue")) {
+                this.setAttribute("alert." + qualityPolicyName + ".sumVariance.failure", e._1 + " variance expected to be between " + minSumVariance + " and " + maxSumVariance + " but was " + variance)
+              } else {
+                throw new Exception("alert." + qualityPolicyName + ".sumVariance.failure:" + e._1 + " variance expected to be between " + minSumVariance + " and " + maxSumVariance + " but was " + variance)
+              }
+            } else {
+              this.setAttribute(e._1 + ".sumVariance.pass", variance.toString())
+            }
+          }
+        } else {
+          logger.info("lastrun metadata not found, skipping DQ checks for: " + "lastrun.metadata." + e._1)
+        }
+      })
+    }
+  }
+}
