@@ -1,0 +1,101 @@
+package flowbot.controller
+
+import com.typesafe.config.{ Config, ConfigFactory }
+
+import org.apache.log4j.Logger
+import com.bac.rctt.apps.flowbot.envelope.FlowEnvelope
+import scala.collection.JavaConversions._
+import java.nio.file.{Paths, Files}
+import java.io.File
+import com.typesafe.config.ConfigResolveOptions
+import com.typesafe.config.ConfigParseOptions
+
+
+object FlowController {
+  def main(args: Array[String]) : Unit = {
+    val logger = Logger.getLogger(getClass().getName())
+
+    var skipSteps = ""
+    var configFilePath = ""
+    //var policyFilePath = ""
+
+    args.sliding(2, 2).toList.collect {
+      case Array("--configFile", _configFilePath: String) => configFilePath = _configFilePath
+      //case Array("--policyFile", _policyFilePath: String) => policyFilePath = _policyFilePath
+      case Array("--skipSteps", _skipSteps: String) => skipSteps = _skipSteps
+    }
+
+
+    //if (args.length < 2 || configFilePath.equals("") || policyFilePath.equals("") ) { logger.error("Usage: spark-submit flowBot.jar --configFile /path/to/configfile.conf --policyFile /path/to/policyFile.conf"); System.exit(0) }
+    if (args.length < 2 || configFilePath.equals("") ) { logger.error("Usage: spark-submit flowBot.jar --configFile /path/to/configfile.conf"); System.exit(0) }
+
+
+/*    
+    if(!Files.exists(Paths.get(policyFilePath)))
+    { throw new Exception(policyFilePath + " not found! Please verify policy file exists with proper permissions!")}
+*/
+
+    val conf: Config = loadConfig(configFilePath)
+
+    var flowEnvelope: FlowEnvelope = new FlowEnvelope()
+
+    //conf.entrySet().filter(e => e.getKey.startsWith("flow") || e.getKey.startsWith("policies")) foreach (e => flowEnvelope.setAttribute(e.getKey, e.getValue.unwrapped().toString()))
+    conf.entrySet().filter(e => e.getKey.startsWith("flow")) foreach (e => flowEnvelope.setAttribute(e.getKey, e.getValue.unwrapped().toString()))
+
+    flowEnvelope.setAttribute("flow.skipSteps", skipSteps)
+
+    logger.debug("flow controller loaded conf=" + conf)
+
+    logger.info("\n   ______           __        __ \n  / __/ /__ _    __/ /  ___  / /_\n / _// / _ \\ |/|/ / _ \\/ _ \\/ __/\n/_/ /_/\\___/__,__/_.__/\\___/\\__/ \n")
+    logger.info("\n   O\n    \\       _ o\n     \\_____/ \n     /_____\\     _________\n    [ .   . ]   | FlowBot!|\n    [   ^   ]  /.---------|\n    [_\\---/_] /  \n O.     |     .O \n   \\____|____/")
+
+    logger.info("Starting FlowController")
+    logger.info("Selecting Flow Controller Engine")
+    flowEnvelope.getAttribute("flow.engine.type") match {
+      case "spark" => {
+        logger.info("Setting Controller Engine to SPARK")
+        var fc = new SparkFlowController(flowEnvelope)
+        flowEnvelope.mergeAttributes(fc.run().getAttributes())
+        if (flowEnvelope.getAttribute("flow.status") == "failure") {
+          throw new Exception(flowEnvelope.getAttribute("flow.name") + " has failed with the following error: " + flowEnvelope.getAttribute("flow.status.message"))
+        }
+      }
+      case "mapreduce" => {
+        throw new Exception("Not yet implemented!")
+      }
+      case "local" => {
+        throw new Exception("Not yet implemented!")
+      }
+    }
+
+  }
+  
+    def loadConfig(configFilePath:String) : Config = {
+    var parsedConfig: Config = null
+    val options:ConfigParseOptions = ConfigParseOptions.defaults().setAllowMissing(true)
+    configFilePath.split("\\,").foreach(
+        individualPath => {
+          println("Processing ::: " + individualPath)
+          
+          if (!individualPath.trim.toLowerCase.endsWith(".conf")) {
+            throw new Exception("Configuration "+individualPath+" should have a .conf extension.")
+          }            
+          
+          if(!Files.exists(Paths.get(individualPath)))
+            { throw new Exception(individualPath + " not found! Please verify config file exists with proper permissions!")}
+
+          if (parsedConfig == null){
+            parsedConfig = ConfigFactory.parseFile(new File(individualPath), options)
+
+          }else{
+            var parsedConfigNext: Config = ConfigFactory.parseFile(new File(individualPath), options)
+            parsedConfig = parsedConfig.withFallback(parsedConfigNext)
+          }
+        }
+          )
+
+    ConfigFactory.load(parsedConfig)
+
+  }
+
+}
