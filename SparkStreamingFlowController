@@ -1,0 +1,89 @@
+package flowbot.controller
+
+import org.apache.spark.{ SparkContext, SparkConf }
+import org.apache.spark.streaming.{ StreamingContext, Seconds }
+import org.apache.spark.sql.SQLContext
+import org.apache.spark.sql.{ Row }
+import org.apache.spark.sql.types.{ StructType, StructField, StringType }
+import com.typesafe.config.Config
+import org.apache.log4j.Logger
+import com.bac.rctt.apps.flowbot.envelope.FlowEnvelope
+import com.bac.rctt.apps.flowbot.util.Functions
+
+class SparkStreamingFlowController(flowEnvelope: FlowEnvelope) {
+  def run(): FlowEnvelope =  {
+    val logger = Logger.getLogger(getClass().getName());
+
+    val clazz: String = flowEnvelope.getAttribute("flow.class")
+    val flowName: String = flowEnvelope.getAttribute("flow.name")
+    val master: String = flowEnvelope.getAttribute("flow.engine.master")
+    val defaultParallelism: String = flowEnvelope.getAttribute("flow.engine.parallelism")
+
+    logger.info("Starting SparkFlowController for Flow:" + flowName)
+
+    flowEnvelope.setAttribute("flow.ts_flow_start", Functions.getCurrentMillis())
+
+    val sparkConf: SparkConf = new SparkConf()
+      .setMaster(master)
+      .setAppName(flowName)
+      .set("spark.default.parallelism", defaultParallelism)
+
+    logger.info("SparkConf=master:" + master + ",appName=" + flowName + ",parallelism=" + sparkConf.get("spark.default.parallelism"))
+    val ssc: StreamingContext = new StreamingContext(sparkConf, Seconds(1))
+    val sc: SparkContext = new SparkContext(sparkConf)
+    
+    logger.info("Instanciating Flow Class:" + clazz)
+    val flow = Class.forName(clazz).newInstance.asInstanceOf[{ def run(sc: StreamingContext, flowEnvelope: FlowEnvelope) }]
+    logger.info("Running Flow:" + flowName)
+
+    try {
+      flow.run(ssc, flowEnvelope)
+      flowEnvelope.setAttribute("flow.status", "success")
+    } catch {
+      case e: Exception =>
+        flowEnvelope.setAttribute("flow.status", "failure")
+        flowEnvelope.setAttribute("flow.status.message", e.getMessage + "\n" + e.getStackTraceString)
+        logger.error("flow.status.message:" + e.getMessage + "\n" + e.getStackTraceString)
+        
+    } finally {
+      logger.info("Run Complete for Flow:" + flowName)
+      flowEnvelope.setAttribute("flow.ts_flow_end", Functions.getCurrentMillis())
+      logger.debug(flowEnvelope.toString())
+
+      if (flowEnvelope.getAttribute("flow.metadata.enabled").toBoolean == true) {
+        logger.info("Metadata is enabled.  Proceeding to save metadata for this flow.")
+        val sqlContext = new SQLContext(sc)
+        import sqlContext.implicits._
+        //flow.uuid, flow.envelope.uuid, flow.name, flow.ts_flow_start, flow.ts_flow_end, key, value
+        val f = sc.makeRDD(flowEnvelope.getAttributes.filter(lastrun => lastrun._1.startsWith("flow.")).map(e => Row(flowEnvelope.getAttribute("flow.uuid"), flowEnvelope.getAttribute("flow.envelope.uuid"), flowEnvelope.getAttribute("flow.name"), flowEnvelope.getAttribute("flow.ts_flow_start"), flowEnvelope.getAttribute("flow.ts_flow_end"), e._1, e._2)).toSeq)
+        val schema = StructType(
+          StructField("flow_uuid", StringType) ::
+            StructField("flow_envelope_uuid", StringType) ::
+            StructField("flow_name", StringType) ::
+            StructField("flow_ts_flow_start", StringType) ::
+            StructField("flow_ts_flow_end", StringType) ::
+            StructField("flow_attribute_key", StringType) ::
+            StructField("flow_attribute_value", StringType) ::
+            Nil)
+
+        if (flowEnvelope.getAttribute("flow.status") == "failure") {
+          logger.info("A failure was detected in this flow.  Proceeding to save metadata to failureLocation for this flow.")
+          sqlContext.createDataFrame(f, schema).repartition(1).write.format(flowEnvelope.getAttribute("flow.metadata.format")).mode(flowEnvelope.getAttribute("flow.metadata.saveMode")).save(flowEnvelope.getAttribute("flow.metadata.failureLocation"))
+        
+        } else {
+          logger.info("This flow has succeeded.  Proceeding to save metadata to outLocation for this flow.")
+          sqlContext.createDataFrame(f, schema).repartition(1).write.format(flowEnvelope.getAttribute("flow.metadata.format")).mode(flowEnvelope.getAttribute("flow.metadata.saveMode")).save(flowEnvelope.getAttribute("flow.metadata.outLocation"))
+        }
+
+      }
+      
+      flowEnvelope.setAttribute("flow.ts_flow_end", Functions.getCurrentMillis())
+    }
+
+    sc.stop()
+    
+    flowEnvelope
+   
+  }
+
+}
