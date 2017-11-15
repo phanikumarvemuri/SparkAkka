@@ -1,0 +1,74 @@
+package flowbot.dataquality
+
+import scala.math.BigDecimal
+
+class ColumnStats(var nulls: Long = 0l,
+  var empties: Long = 0l,
+  var totalCount: Long = 0l,
+  var uniqueValues: Long = 0l,
+  var max:BigDecimal = BigDecimal(Double.MinPositiveValue),
+  var min: BigDecimal = BigDecimal(Double.MaxValue),
+  var sum: BigDecimal = BigDecimal(0),
+  var avg: BigDecimal = BigDecimal(0)) extends Serializable {
+
+  def +=(colValue: Any, colCount: Long): Unit = {
+    totalCount += colCount
+    uniqueValues += 1
+    
+    if (colValue == null) {
+      nulls = colCount
+    } else if (colValue.isInstanceOf[String]) {
+      val colStringValue = colValue.asInstanceOf[String]
+      if (colStringValue.trim().isEmpty) {
+        empties = colCount
+      }
+    } else if (colValue.isInstanceOf[Long]) {
+      val colLongValue = colValue.asInstanceOf[Long]
+      if (max < colLongValue) max = colLongValue
+      if (min > colLongValue) min = colLongValue
+      sum += (colLongValue * colCount)
+    } else if (colValue.isInstanceOf[Int]) {
+      val colIntValue = colValue.asInstanceOf[Int]
+      if (max < colIntValue) max = colIntValue
+      if (min > colIntValue) min = colIntValue
+      sum += (colIntValue * colCount)
+
+    } else if (colValue.isInstanceOf[Double]) {
+      val colDoubleValue = colValue.asInstanceOf[Double]
+      if (max < colDoubleValue) max = colDoubleValue
+      if (min > colDoubleValue) min = colDoubleValue
+      sum += (colDoubleValue * colCount)
+    } else if (colValue.isInstanceOf[Float]) {
+      val colFloatValue = colValue.asInstanceOf[Float]
+      if (max < colFloatValue) max = colFloatValue
+      if (min > colFloatValue) min = colFloatValue
+      sum += (colFloatValue * colCount)
+    }else if (colValue.isInstanceOf[java.math.BigDecimal]) {
+      val colbigDecimalValue = colValue.asInstanceOf[java.math.BigDecimal]
+      if (max < colbigDecimalValue.doubleValue()) max = colbigDecimalValue.doubleValue()
+      if (min > colbigDecimalValue.doubleValue()) min = colbigDecimalValue.doubleValue()
+      sum += (colbigDecimalValue.doubleValue() * colCount)
+    }
+    if (sum != null){
+      avg = sum / totalCount  
+    }
+    
+    //topNValues.add(colValue, colCount)
+  }
+
+  def +=(columnStats: ColumnStats): Unit = {
+    totalCount += columnStats.totalCount
+    uniqueValues += columnStats.uniqueValues
+    nulls += columnStats.nulls
+    empties += columnStats.empties
+    sum += columnStats.sum
+    max = max.max(columnStats.max)
+    min = min.min(columnStats.min)
+    avg = sum / totalCount
+    //columnStats.topNValues.topNCountsForColumnArray.foreach{ r =>
+    //  topNValues.add(r._1, r._2)
+    //}
+  }
+
+  override def toString = s"ColumnStats(nulls=$nulls, empties=$empties, totalCount=$totalCount, uniqueValues=$uniqueValues, maxLong=$max, minLong=$min, sumLong=$sum, avgLong=$avg)"
+}
