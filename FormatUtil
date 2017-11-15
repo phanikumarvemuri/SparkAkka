@@ -1,0 +1,175 @@
+package com.bac.rctt.apps.flowbot.util
+
+import java.text.NumberFormat;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+object FormatUtils {
+
+  private val UNION = "|"
+
+  // for Data Sizes
+  private val BYTES_IN_KILOBYTE: Double = 1024
+  private val BYTES_IN_MEGABYTE = BYTES_IN_KILOBYTE * 1024
+  private val BYTES_IN_GIGABYTE = BYTES_IN_MEGABYTE * 1024
+  private val BYTES_IN_TERABYTE = BYTES_IN_GIGABYTE * 1024
+
+  // for Time Durations
+  private val NANOS = join(UNION, Array("ns", "nano", "nanos", "nanosecond", "nanoseconds"))
+  private val MILLIS = join(UNION, Array("ms", "milli", "millis", "millisecond", "milliseconds"))
+  private val SECS = join(UNION, Array("s", "sec", "secs", "second", "seconds"))
+  private val MINS = join(UNION, Array("m", "min", "mins", "minute", "minutes"))
+  private val HOURS = join(UNION, Array("h", "hr", "hrs", "hour", "hours"))
+  private val DAYS = join(UNION, Array("d", "day", "days"))
+  private val WEEKS = join(UNION, Array("w", "wk", "wks", "week", "weeks"))
+
+  private val VALID_TIME_UNITS = join(UNION, Array(NANOS, MILLIS, SECS, MINS, HOURS, DAYS, WEEKS))
+  private val TIME_DURATION_REGEX = "(\\d+)\\s*(" + VALID_TIME_UNITS + ")"
+  private val TIME_DURATION_PATTERN = Pattern.compile(TIME_DURATION_REGEX)
+
+  /**
+   * Formats the specified duration in 'mm:ss.SSS' format.
+   *
+   * @param sourceDuration the duration to format
+   * @param sourceUnit the unit to interpret the duration
+   * @return representation of the given time data in minutes/seconds
+   */
+  def formatMinutesSeconds(sourceDuration: Long, sourceUnit: TimeUnit): String = {
+    val millis = TimeUnit.MILLISECONDS.convert(sourceDuration, sourceUnit)
+
+    val millisInMinute = TimeUnit.MILLISECONDS.convert(1, TimeUnit.MINUTES)
+    val minutes: Int = (millis / millisInMinute).toInt
+    val secondsMillisLeft = millis - minutes * millisInMinute
+
+    val millisInSecond = TimeUnit.MILLISECONDS.convert(1, TimeUnit.SECONDS)
+    val seconds: Int = (secondsMillisLeft / millisInSecond).toInt
+    val millisLeft = secondsMillisLeft - seconds * millisInSecond
+
+    return pad2Places(minutes) + ":" + pad2Places(seconds) + "." + pad3Places(millisLeft)
+  }
+
+  /**
+   * Formats the specified duration in 'HH:mm:ss.SSS' format.
+   *
+   * @param sourceDuration the duration to format
+   * @param sourceUnit the unit to interpret the duration
+   * @return representation of the given time data in hours/minutes/seconds
+   */
+  def formatHoursMinutesSeconds(sourceDuration: Long, sourceUnit: TimeUnit): String = {
+    val millis = TimeUnit.MILLISECONDS.convert(sourceDuration, sourceUnit)
+
+    val millisInHour = TimeUnit.MILLISECONDS.convert(1, TimeUnit.HOURS)
+    val hours: Int = (millis / millisInHour).toInt
+    val minutesSecondsMillisLeft = millis - hours * millisInHour
+
+    pad2Places(hours) + ":" + formatMinutesSeconds(minutesSecondsMillisLeft, TimeUnit.MILLISECONDS)
+  }
+
+  def pad2Places(value: Long): String = {
+    if (value < 10) { "0" + value } else { value.toString() }
+  }
+
+  def pad3Places(value: Long): String = {
+    if (value < 100) { "0" + pad2Places(value) } else { value.toString() }
+  }
+
+  /**
+   * Formats the specified data size in human readable format.
+   *
+   * @param dataSize Data size in bytes
+   * @return Human readable format
+   */
+  def formatDataSize(dataSize: Double): String = {
+    // initialize the formatter
+    val format = NumberFormat.getNumberInstance()
+    format.setMaximumFractionDigits(2)
+
+    // check terabytes
+    var dataSizeToFormat = dataSize / BYTES_IN_TERABYTE
+    if (dataSizeToFormat > 1) {
+      return format.format(dataSizeToFormat) + " TB"
+    }
+
+    // check gigabytes
+    dataSizeToFormat = dataSize / BYTES_IN_GIGABYTE
+    if (dataSizeToFormat > 1) {
+      return format.format(dataSizeToFormat) + " GB"
+    }
+
+    // check megabytes
+    dataSizeToFormat = dataSize / BYTES_IN_MEGABYTE
+    if (dataSizeToFormat > 1) {
+      return format.format(dataSizeToFormat) + " MB"
+    }
+
+    // check kilobytes
+    dataSizeToFormat = dataSize / BYTES_IN_KILOBYTE
+    if (dataSizeToFormat > 1) {
+      return format.format(dataSizeToFormat) + " KB"
+    }
+
+    // default to bytes
+    return format.format(dataSize) + " bytes"
+  }
+
+  def getTimeDuration(value: String, desiredUnit: TimeUnit): Long = {
+    var matcher = TIME_DURATION_PATTERN.matcher(value.toLowerCase())
+    if (!matcher.matches()) {
+      throw new IllegalArgumentException("Value '" + value + "' is not a valid Time Duration")
+    }
+
+    var duration = matcher.group(1)
+    val units = matcher.group(2)
+    var specifiedTimeUnit: TimeUnit = null
+    units.toLowerCase() match {
+      case "ns" => specifiedTimeUnit = TimeUnit.NANOSECONDS;
+      case "nano" => specifiedTimeUnit = TimeUnit.NANOSECONDS;
+      case "nanos" => specifiedTimeUnit = TimeUnit.NANOSECONDS;
+      case "nanoseconds" => specifiedTimeUnit = TimeUnit.NANOSECONDS;
+      case "ms" => specifiedTimeUnit = TimeUnit.MILLISECONDS;
+      case "milli" => specifiedTimeUnit = TimeUnit.MILLISECONDS;
+      case "millis" => specifiedTimeUnit = TimeUnit.MILLISECONDS;
+      case "milliseconds" => specifiedTimeUnit = TimeUnit.MILLISECONDS;
+      case "s" => specifiedTimeUnit = TimeUnit.SECONDS;
+      case "sec" => specifiedTimeUnit = TimeUnit.SECONDS;
+      case "secs" => specifiedTimeUnit = TimeUnit.SECONDS;
+      case "second" => specifiedTimeUnit = TimeUnit.SECONDS;
+      case "seconds" => specifiedTimeUnit = TimeUnit.SECONDS;
+      case "m" => specifiedTimeUnit = TimeUnit.MINUTES;
+      case "min" => specifiedTimeUnit = TimeUnit.MINUTES;
+      case "mins" => specifiedTimeUnit = TimeUnit.MINUTES;
+      case "minute" => specifiedTimeUnit = TimeUnit.MINUTES;
+      case "minutes" => specifiedTimeUnit = TimeUnit.MINUTES;
+      case "h" => specifiedTimeUnit = TimeUnit.HOURS;
+      case "hr" => specifiedTimeUnit = TimeUnit.HOURS;
+      case "hrs" => specifiedTimeUnit = TimeUnit.HOURS;
+      case "hour" => specifiedTimeUnit = TimeUnit.HOURS;
+      case "hours" => specifiedTimeUnit = TimeUnit.HOURS;
+      case "d" => specifiedTimeUnit = TimeUnit.DAYS;
+      case "day" => specifiedTimeUnit = TimeUnit.DAYS;
+      case "days" => specifiedTimeUnit = TimeUnit.DAYS;
+    }
+
+    var durationVal = duration.toLong
+    desiredUnit.convert(durationVal, specifiedTimeUnit)
+  }
+
+  def formatUtilization(utilization: Double): String = utilization + "%"
+
+
+  def join(delimiter: String, values: Array[String]): String = {
+    if (values.length == 0) {
+      return ""
+    } else if (values.length == 1) {
+      return values(0)
+    }
+
+    val sb = new StringBuilder()
+    sb.append(values(0))
+
+    values.foreach(e => sb.append(delimiter).append(e))
+
+    sb.toString()
+  }
+}
