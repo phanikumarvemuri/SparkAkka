@@ -1,0 +1,61 @@
+package util
+
+import org.apache.spark.sql.types.StructType
+import scala.collection.mutable.ArrayBuffer
+
+/**
+* Date      		Developer                  	Change
+* ========= 		========================== 	===============================================================
+* 12-Sep-17    	Ramamurthy Pavan. N         Made changes to accomodate multiple partition columns in CREATE TABLE statement
+* 
+* 
+*/
+object SchemaUtil {
+
+  def getCreateHiveTableWithPartitionsStatement(schema: StructType, database: String, table: String, format: String, partition: String, location: String, rowCount: String): String = {
+    
+    var schemaSeq = getHiveDataType(schema).toBuffer
+
+    val partitionArr = partition.toLowerCase.split(",") 
+    var partitionInfo = ArrayBuffer[String]()
+    schemaSeq.foreach(e => if( partitionArr.contains(e.trim.split(" ")(0))) {partitionInfo += e})
+    schemaSeq --= partitionInfo  
+      
+    "CREATE EXTERNAL TABLE " + database + "." + table + " (" + schemaSeq.mkString(",") + ") PARTITIONED BY ( " + partitionInfo.mkString(",") + " ) STORED AS " + format + " LOCATION '" + location + "' TBLPROPERTIES ('numRows'='"+ rowCount +"', 'STATS_GENERATED_VIA_STATS_TASK'='true', 'CREATED_BY_FLOWBOT='='true')"
+  }
+
+  def getCreateHiveTableStatement(schema: StructType, database: String, table: String, format: String,location: String, rowCount: String): String = {
+    var schemaSeq: Seq[String] = getHiveDataType(schema)
+    "CREATE EXTERNAL TABLE " + database + "." + table + " (" + schemaSeq.mkString(",") + ") STORED AS " + format + " LOCATION '" + location + "' TBLPROPERTIES ('numRows'='"+ rowCount +"', 'STATS_GENERATED_VIA_STATS_TASK'='true', 'CREATED_BY_FLOWBOT='='true')"
+  }
+
+  def getHiveDataType(schema: StructType): Seq[String] = {
+    var schemaSeq = schema.map(x => x.name.toLowerCase.concat(" ").concat(x.dataType.toString match {
+      case "StringType" => "STRING"
+      case "IntegerType" => "INT"
+      case "BooleanType" => "BOOLEAN"
+      case "ByteType" => "TINYINT"
+      case "DoubleType" => "DOUBLE"
+      case "FloatType" => "FLOAT"
+      case "LongType" => "BIGINT"
+      case "DateType" => "STRING"
+      case "TimestampType" => "TIMESTAMP"
+      case _ =>
+        //
+        if (x.dataType.toString().contains("DecimalType")) {
+          x.dataType.toString().replace("DecimalType", "DECIMAL")
+        } else {
+          "STRING"
+        }
+    }))
+    schemaSeq
+  }
+
+  def getHiveDropTableStatement(database: String, table: String): String = {
+    "DROP TABLE IF EXISTS " + database + "." + table
+  }
+
+  def getRepairHiveTableStatement(database: String, table: String): String = {
+    "MSCK REPAIR TABLE " + database + "." + table
+  }
+}
