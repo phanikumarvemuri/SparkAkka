@@ -1,0 +1,49 @@
+package com.bac.rctt.apps.flowbot.processors
+
+import com.bac.rctt.apps.flowbot.envelope.FlowEnvelope
+import org.apache.spark.SparkContext
+import com.bac.rctt.apps.flowbot.util.Mail
+
+/**
+* Date      		Developer                  	Change
+* ========= 		========================== 	===============================================================
+* 20-Sep-17    	Ramamurthy Pavan. N         Initial version of PutEmail processor
+*
+*
+*/
+class PutEmail extends BaseProcessor {
+
+  def run(sc: SparkContext, hiveContext: org.apache.spark.sql.hive.HiveContext, flowEnvelope: FlowEnvelope, step: String): FlowEnvelope = {
+    logger.info("found output step! Going to excute PutEmail processor code")
+    
+    new Mail(step, flowEnvelope).sendEmail
+
+    flowEnvelope
+  }  
+
+  override def validate(flowEnvelope: FlowEnvelope, step: String): Boolean = {
+    logger.info("Verifying " + step)
+    var confGood = super.validate(flowEnvelope: FlowEnvelope, step: String)
+
+    if (!flowEnvelope.hasAttribute(step + ".to") && !flowEnvelope.hasAttribute(step + ".cc") && !flowEnvelope.hasAttribute(step + ".bcc")) {
+      logger.error(step + " is missing to, cc and bcc. One of the three must be defined for action PutEmail")
+      confGood = false
+    }
+    
+    for (attribute <- Set("smtpHost", "from", "message")) {
+      if (!flowEnvelope.hasAttribute(step + "." + attribute)) {
+        logger.error(step + " is missing attribute " + attribute + ", which is required for action PutEmail")
+        confGood = false
+      }
+    }
+    
+    if(flowEnvelope.hasAttribute(step + ".includeAllAttributesInMessage")) {
+      if(!(Set("true", "false") contains flowEnvelope.getAttribute(step + ".includeAllAttributesInMessage"))) {
+        logger.error(step + " contains invalid includeAllAttributesInMessage attribute value = " + flowEnvelope.getAttribute(step + ".includeAllAttributesInMessage") + " Expected either one of the following values: true, false")
+        confGood = false
+      }
+     }    
+
+    confGood
+  }  
+}
