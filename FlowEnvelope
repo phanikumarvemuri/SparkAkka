@@ -1,0 +1,9 @@
+package flowbot.envelope
+
+class FlowEnvelope() extends Envelope{
+  
+  logger.debug("New Instance of FlowEnvelope")
+  
+  this.setAttribute("flow.envelope.uuid", java.util.UUID.randomUUID().toString())
+
+}
