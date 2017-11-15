@@ -1,0 +1,107 @@
+package com.bac.rctt.apps.flowbot.util
+
+import javax.mail.Session
+import javax.mail.Message
+import javax.mail.internet.MimeMessage
+import javax.mail.internet.MimeBodyPart
+import javax.mail.internet.MimeMultipart
+import javax.mail.internet.InternetAddress
+import javax.mail.Transport
+import java.util.Properties
+import com.bac.rctt.apps.flowbot.envelope.FlowEnvelope
+import java.util.Date
+import scala.collection.immutable.ListMap
+
+/**
+* Date      		Developer                  	Change
+* ========= 		========================== 	===============================================================
+* 20-Sep-17    	Ramamurthy Pavan. N         Initial version of PutEmail processor
+*
+*
+*/
+class Mail(step: String, envelope: FlowEnvelope) {
+  
+  val multiPart: MimeMultipart = new MimeMultipart
+  val bodySeparator = "\n\n--------------------------------------------------\n"
+
+  def sendEmail(): Unit = {
+    val properties: Properties = new Properties
+    
+    properties.put("mail.smtp.host", envelope.getAttribute(step + ".smtpHost"))
+    if(envelope.hasAttribute(step + ".port")) {
+      properties.put("mail.smtp.port", envelope.getAttribute(step + ".smtpPort"))
+    }
+    
+    val session = Session.getInstance(properties)
+    val message = createMailMessage(session)
+    prepareMessageBody
+    message.setContent(multiPart)
+    send(message)
+  }
+
+  def createMailMessage(session: Session) : MimeMessage = {
+    val message = new MimeMessage(session)
+
+    message.setFrom(new InternetAddress(envelope.getAttribute(step + ".from")))
+    if(envelope.hasAttribute(step + ".to")) {
+      message.setRecipients(Message.RecipientType.TO, envelope.getAttribute(step + ".to"))
+    }
+    if(envelope.hasAttribute(step + ".cc")) {
+      message.setRecipients(Message.RecipientType.CC, envelope.getAttribute(step + ".cc"))
+    }
+    if(envelope.hasAttribute(step + ".bcc")) {
+      message.setRecipients(Message.RecipientType.BCC, envelope.getAttribute(step + ".bcc"))
+    }    
+    
+    val subject = {
+      if(envelope.hasAttribute(step + ".subject")) {
+        envelope.getAttribute(step + ".subject")
+      } else {
+        "Message from FlowBot"
+      }
+    }
+    message.setSubject(subject)
+    message
+  }
+
+  def prepareMessageBody() : Unit = {
+    val mimeBody = new MimeBodyPart
+    val content = StringBuilder.newBuilder 
+    
+    if(envelope.hasAttribute(step + ".message")) {
+      content.append(envelope.getAttribute(step + ".message"))
+    }
+    
+    for( (k, v) <- envelope.getAttributes()) {
+      var index = content.lastIndexOf(k)
+      while(index != -1) {
+        content.replace(index, index + k.length, v)
+        index = content.lastIndexOf(k)
+      }
+    }
+    
+    if(envelope.getAttribute(step + ".includeAllAttributesInMessage") == "true") {
+      content.append(bodySeparator)
+      content.append("\nFlow Attributes:")
+       content.append("<html><body><table style='border:2px solid black'>")
+     
+      val sortedmap = ListMap((envelope.getAttributes()).toSeq.sortWith(_._1 < _._1):_*)
+      for( (k, v) <- sortedmap) {
+        content.append("<tr><td style='border-style: solid; border-width: 1px'>").append(k).append("</td><td style='border-style: solid; border-width: 1px'>").append(v).append("</td></tr>")
+        //content.append(String.format("\n\t%1$s = %2$s", k, v)); 
+      }
+      //content.append("\n")
+      content.append("</table></body></html>")
+    }
+     
+     mimeBody.setText(content.toString,"utf-8","html")
+     multiPart.addBodyPart(mimeBody)
+    
+  }
+  
+  def send(message : MimeMessage) : Unit = {
+    message.setSentDate(new Date)
+    Transport.send(message)    
+  }
+
+}
