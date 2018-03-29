@@ -1,0 +1,198 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>org.ais.di</groupId>
+  <artifactId>athena</artifactId>
+  <version>1.0-SNAPSHOT</version>
+  <packaging>jar</packaging>
+
+  <name>athena</name>
+  <url>http://maven.apache.org</url>
+
+    <repositories>
+</repositories>
+
+  <properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+      <jdk.version>1.8</jdk.version>
+      <scala.version>2.11.8</scala.version>
+      <spark-scala.version>2.11</spark-scala.version>
+      <spark.version>2.1.0</spark.version>
+      <maven-scala-plugin.version>2.15.2</maven-scala-plugin.version>
+      <scala-maven.version>3.2.2</scala-maven.version>
+      <scalatest-maven.version>2.0.0</scalatest-maven.version>
+      <scalatest.version>3.2.0-SNAP5</scalatest.version>
+      <maven-jar.version>3.0.2</maven-jar.version>
+      <maven-assembly.version>3.1.0</maven-assembly.version>
+      <junit.version>3.8.1</junit.version>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>junit</groupId>
+      <artifactId>junit</artifactId>
+      <version>${junit.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.scala-tools</groupId>
+      <artifactId>maven-scala-plugin</artifactId>
+      <version>${maven-scala-plugin.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.scala-lang</groupId>
+      <artifactId>scala-library</artifactId>
+      <version>${scala.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.scala-lang</groupId>
+      <artifactId>scala-compiler</artifactId>
+      <version>${scala.version}</version>
+    </dependency>
+      <dependency>
+          <groupId>org.apache.spark</groupId>
+          <artifactId>spark-core_${spark-scala.version}</artifactId>
+          <version>${spark.version}</version>
+      </dependency>
+      <dependency>
+          <groupId>org.apache.spark</groupId>
+          <artifactId>spark-sql_${spark-scala.version}</artifactId>
+          <version>${spark.version}</version>
+      </dependency>
+      <dependency>
+          <groupId>org.apache.spark</groupId>
+          <artifactId>spark-hive_${spark-scala.version}</artifactId>
+          <version>${spark.version}</version>
+      </dependency>
+      <dependency>
+          <groupId>org.scalatest</groupId>
+          <artifactId>scalatest_${spark-scala.version}</artifactId>
+          <version>${scalatest.version}</version>
+          <scope>test</scope>
+      </dependency>
+  </dependencies>
+  <build>
+    <plugins>
+      <plugin>
+      <groupId>net.alchim31.maven</groupId>
+      <artifactId>scala-maven-plugin</artifactId>
+      <version>${scala-maven.version}</version>
+        <executions>
+          <execution>
+            <id>scala-compile-first</id>
+            <phase>process-resources</phase>
+            <goals>
+              <goal>add-source</goal>
+              <goal>compile</goal>
+            </goals>
+          </execution>
+          <execution>
+            <id>scala-test-compile</id>
+            <phase>process-test-resources</phase>
+            <goals>
+              <goal>testCompile</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+        <plugin>
+            <groupId>org.scalatest</groupId>
+            <artifactId>scalatest-maven-plugin</artifactId>
+            <version>${scalatest-maven.version}</version>
+            <configuration>
+                <reportsDirectory>${project.build.directory}/surefire-reports</reportsDirectory>
+                <junitxml>.</junitxml>
+            </configuration>
+            <executions>
+                <execution>
+                    <id>test</id>
+                    <goals>
+                        <goal>test</goal>
+                    </goals>
+                </execution>
+            </executions>
+        </plugin>
+
+        <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-jar-plugin</artifactId>
+            <version>${maven-jar.version}</version>
+            <configuration>
+                <skipIfEmpty>true</skipIfEmpty>
+            </configuration>
+            <executions>
+                <execution>
+                    <id>default-jar</id>
+                    <phase>package</phase>
+                    <goals>
+                        <goal>jar</goal>
+                    </goals>
+                </execution>
+
+
+            </executions>
+        </plugin>
+
+        <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-assembly-plugin</artifactId>
+            <version>${maven-assembly.version}</version>
+            <executions>
+                <execution>
+                    <id>dist</id>
+                    <phase>package</phase>
+                    <goals>
+                        <goal>single</goal>
+                    </goals>
+                    <configuration>
+                        <descriptors>
+                            <descriptor>src/assembly/assembly.xml</descriptor>
+                        </descriptors>
+                    </configuration>
+                </execution>
+            </executions>
+        </plugin>
+
+    </plugins>
+  </build>
+</project>
+
+--assembly.xml
+
+
+<assembly>
+    <id>dist</id>
+    <formats>
+        <format>zip</format>
+    </formats>
+    <includeBaseDirectory>false</includeBaseDirectory>
+
+    <fileSets>
+        <fileSet>
+            <includes>
+                <include>README</include>
+            </includes>
+        </fileSet>
+        <fileSet>
+            <directory>
+                ${project.basedir}/athena_src/
+            </directory>
+            <outputDirectory>athena</outputDirectory>
+            <includes>
+                <include>**/*</include>
+            </includes>
+        </fileSet>
+    </fileSets>
+
+    <dependencySets>
+        <dependencySet>
+            <includes>
+                <include>org.ais.di:*:jar</include>
+            </includes>
+        </dependencySet>
+    </dependencySets>
+
+</assembly>
+
+
